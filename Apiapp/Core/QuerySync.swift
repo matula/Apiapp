@@ -53,16 +53,20 @@ enum QuerySync {
         return result
     }
 
+    // Servers almost all read a + in a query as a space, so the table does too. That has
+    // to happen before percent-decoding, so that %2B still comes through as a plus sign.
     private static func decode(_ text: String) -> String {
-        text.removingPercentEncoding ?? text
+        let spaced = text.replacingOccurrences(of: "+", with: " ")
+        return spaced.removingPercentEncoding ?? spaced
     }
 
-    // Only the characters that would change how the query parses. Spaces and the
-    // like stay readable in the URL field and are encoded when the request is sent.
+    // Only the characters that would change how the query parses or reads back. Spaces and
+    // the like stay readable in the URL field and are encoded when the request is sent.
     private static func encode(_ text: String, extra: String) -> String {
         var result = text.replacingOccurrences(of: "%", with: "%25")
         result = result.replacingOccurrences(of: "&", with: "%26")
         result = result.replacingOccurrences(of: "#", with: "%23")
+        result = result.replacingOccurrences(of: "+", with: "%2B")
         if extra.contains("=") { result = result.replacingOccurrences(of: "=", with: "%3D") }
         return result
     }

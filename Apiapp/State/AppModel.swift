@@ -214,15 +214,19 @@ final class AppModel {
             return
         }
         let draft = tabs[index].draft
+        let variables = activeEnvironment?.resolvedValues ?? [:]
         let request: URLRequest
         do {
-            request = try RequestBuilder.build(draft, variables: activeEnvironment?.resolvedValues ?? [:])
+            request = try RequestBuilder.build(draft, variables: variables)
         } catch {
             tabs[index].phase = .failed(error.localizedDescription)
             return
         }
+        let credentialHeaders = RequestBuilder.credentialHeaderNames(for: draft, variables: variables)
 
         tabs[index].phase = .sending
+        // Whatever comes back isn't the response that was saved, so it can be saved itself.
+        tabs[index].savedResponseID = nil
         let entry = record(draft)
         // Once it's in history, closing an unsaved tab loses nothing.
         if tabs[index].savedRequestID == nil { tabs[index].baseline = draft }
@@ -230,7 +234,7 @@ final class AppModel {
         sendTasks[tabID] = Task { [weak self, runner] in
             let phase: RequestPhase
             do {
-                phase = .finished(try await runner.send(request))
+                phase = .finished(try await runner.send(request, credentialHeaders: credentialHeaders))
             } catch is CancellationError {
                 phase = .cancelled
             } catch let error as URLError where error.code == .cancelled {
@@ -325,8 +329,15 @@ final class AppModel {
 
     func requests(in folderID: UUID?) -> [SavedRequest] {
         savedRequests
-            .filter { $0.folderID == folderID }
+            .filter { shownFolderID(of: $0) == folderID }
             .sorted { $0.request.displayName.localizedStandardCompare($1.request.displayName) == .orderedAscending }
+    }
+
+    /// A request whose folder is gone, say because folders.json couldn't be read, shows on
+    /// the main list rather than nowhere. Its file keeps the folder until it's moved or saved.
+    private func shownFolderID(of saved: SavedRequest) -> UUID? {
+        guard let id = saved.folderID, folders.contains(where: { $0.id == id }) else { return nil }
+        return id
     }
 
     func duplicate(savedRequest id: UUID) {
@@ -500,6 +511,7 @@ final class AppModel {
     // MARK: Loading and persistence
 
     private func load() {
+        var readEverything = false
         do {
             let snapshot = try store.load()
             folders = snapshot.folders
@@ -531,16 +543,21 @@ final class AppModel {
             activeTabID = snapshot.workspace.activeTabID
             if !snapshot.unreadableFiles.isEmpty {
                 let files = snapshot.unreadableFiles.joined(separator: ", ")
-                alertMessage = "These files couldn’t be read and were skipped: \(files)"
+                alertMessage = "These files couldn’t be read and were skipped: \(files). Copies ending in .broken were kept beside them."
             }
-            if snapshot.environments == nil { try store.save(environments: environments) }
+            // The starter environment is written out only when the file is truly missing. One
+            // that exists but couldn't be read is left for the user to fix.
+            if snapshot.environments == nil, snapshot.isComplete { try store.save(environments: environments) }
+            readEverything = snapshot.isComplete
         } catch {
             alertMessage = error.localizedDescription
         }
 
         if tabs.isEmpty { newTab() }
         if activeTab == nil { activeTabID = tabs.first?.id }
-        pruneSecrets()
+        // After a failed or partial read, owners that are still on disk look as if they're
+        // gone, and pruning would throw their secrets away for good.
+        if readEverything { pruneSecrets() }
     }
 
     private static func starterEnvironment() -> RequestEnvironment {

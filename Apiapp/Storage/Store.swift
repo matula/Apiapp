@@ -21,9 +21,14 @@ struct LibrarySnapshot {
     var requests: [SavedRequest] = []
     var history: [HistoryEntry] = []
     var responses: [SavedResponse] = []
+    /// Nil when there is no environments file, and also when there is one that couldn't be read.
     var environments: [RequestEnvironment]?
     var workspace = WorkspaceState()
+    /// Files and directories that couldn't be read, by name. Each file has a copy beside it ending in `.broken`.
     var unreadableFiles: [String] = []
+
+    /// False after a partial read, when saving over what's on disk or cleaning up after it could lose data.
+    var isComplete: Bool { unreadableFiles.isEmpty }
 }
 
 /// Plain JSON files, one per saved request, history entry and saved response:
@@ -120,12 +125,28 @@ struct Store {
             return try Self.decoder.decode(T.self, from: Data(contentsOf: url))
         } catch {
             unreadable.append(url.lastPathComponent)
+            keepCopy(of: url)
             return nil
         }
     }
 
+    /// A file that can't be read stays where it is, but the app may save over it later, so
+    /// a copy is kept beside it. The copy's `.broken` extension keeps it out of future reads.
+    private func keepCopy(of url: URL) {
+        let copy = url.appendingPathExtension("broken")
+        guard !FileManager.default.fileExists(atPath: copy.path) else { return }
+        try? FileManager.default.copyItem(at: url, to: copy)
+    }
+
     private func readAll<T: Decodable>(in directory: URL, unreadable: inout [String]) -> [T] {
-        let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+        let files: [URL]
+        do {
+            files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        } catch {
+            // Nothing in here was seen, which matters as much as a file that wouldn't parse.
+            unreadable.append(directory.lastPathComponent + "/")
+            return []
+        }
         return files.filter { $0.pathExtension == "json" }.compactMap { read($0, unreadable: &unreadable) }
     }
 }

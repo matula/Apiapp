@@ -5,13 +5,28 @@ struct HeaderField: Codable, Equatable, Sendable {
     var value: String
 }
 
+/// One step of a redirect: the status that sent the request on, and where it went.
+struct RedirectHop: Codable, Equatable, Sendable {
+    var statusCode: Int
+    var url: String
+}
+
 /// What came back from the server.
 struct ResponseSnapshot: Equatable, Sendable {
     var statusCode: Int
     var headers: [HeaderField]
     var body: Data
     var duration: TimeInterval
+    /// Where the response came from, which after a redirect isn't where the request went.
     var url: String
+    var redirects: [RedirectHop] = []
+
+    /// One line for the response pane, such as "Redirected (301) to https://…".
+    var redirectSummary: String {
+        let codes = redirects.map { String($0.statusCode) }.joined(separator: ", ")
+        let lead = redirects.count == 1 ? "Redirected" : "Redirected \(redirects.count) times"
+        return "\(lead) (\(codes)) to \(url)"
+    }
 
     /// The standard phrase for the code. Foundation's own text calls 200 "no error".
     var reason: String {
@@ -38,7 +53,7 @@ struct ResponseSnapshot: Equatable, Sendable {
 // Text bodies are stored as text so a saved response stays readable in its file.
 extension ResponseSnapshot: Codable {
     private enum CodingKeys: String, CodingKey {
-        case statusCode, headers, bodyText, bodyBase64, duration, url
+        case statusCode, headers, bodyText, bodyBase64, duration, url, redirects
     }
 
     init(from decoder: Decoder) throws {
@@ -47,6 +62,7 @@ extension ResponseSnapshot: Codable {
         headers = try c.decode([HeaderField].self, forKey: .headers)
         duration = try c.decode(TimeInterval.self, forKey: .duration)
         url = try c.decode(String.self, forKey: .url)
+        redirects = try c.decodeIfPresent([RedirectHop].self, forKey: .redirects) ?? []
         if let text = try c.decodeIfPresent(String.self, forKey: .bodyText) {
             body = Data(text.utf8)
         } else {
@@ -61,6 +77,7 @@ extension ResponseSnapshot: Codable {
         try c.encode(headers, forKey: .headers)
         try c.encode(duration, forKey: .duration)
         try c.encode(url, forKey: .url)
+        if !redirects.isEmpty { try c.encode(redirects, forKey: .redirects) }
         if let text = String(data: body, encoding: .utf8) {
             try c.encode(text, forKey: .bodyText)
         } else {

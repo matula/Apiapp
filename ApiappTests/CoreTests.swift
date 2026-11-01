@@ -184,6 +184,16 @@ import Testing
         draft.setURL("https://x.dev/a?one=12")
         #expect(draft.params[0].id == id)
     }
+
+    @Test func plusSignsSurviveTheTable() {
+        var draft = RequestDraft()
+        draft.setURL("https://x.dev/a?literal=a%2Bb&spaced=c+d")
+        #expect(draft.params.map(\.value) == ["a+b", "c d"])
+        draft.setParams(draft.params)
+        #expect(draft.url == "https://x.dev/a?literal=a%2Bb&spaced=c d")
+        draft.setParams([KeyValue(key: "typed", value: "1+1")])
+        #expect(draft.url == "https://x.dev/a?typed=1%2B1")
+    }
 }
 
 @Suite struct ContentTypeTests {
@@ -461,6 +471,16 @@ import Testing
             try RequestBuilder.build(request, variables: [:])
         }
     }
+
+    @Test func namesTheCredentialHeaders() {
+        var request = draft()
+        #expect(RequestBuilder.credentialHeaderNames(for: request, variables: [:]) == ["Authorization"])
+        request.auth.kind = .apiKey
+        request.auth.apiKeyName = "{{keyHeader}}"
+        #expect(RequestBuilder.credentialHeaderNames(for: request, variables: ["keyHeader": "X-Key"]) == ["Authorization", "X-Key"])
+        request.auth.apiKeyPlacement = .query
+        #expect(RequestBuilder.credentialHeaderNames(for: request, variables: [:]) == ["Authorization"])
+    }
 }
 
 @Suite struct ResponseDisplayTests {
@@ -510,6 +530,20 @@ import Testing
 
     @Test func listsHeaders() {
         #expect(ResponseDisplay(snapshot("", contentType: "a/b")).headersText == "Content-Type: a/b")
+    }
+
+    @Test func redirectsRoundTripAndOlderFilesHaveNone() throws {
+        var value = snapshot("x", contentType: "text/plain")
+        value.redirects = [RedirectHop(statusCode: 301, url: "https://x.dev/after")]
+        value.url = "https://x.dev/after"
+        let data = try JSONEncoder().encode(value)
+        #expect(try JSONDecoder().decode(ResponseSnapshot.self, from: data) == value)
+        #expect(value.redirectSummary == "Redirected (301) to https://x.dev/after")
+        value.redirects.append(RedirectHop(statusCode: 302, url: "https://x.dev/after"))
+        #expect(value.redirectSummary == "Redirected 2 times (301, 302) to https://x.dev/after")
+
+        let older = #"{"statusCode":200,"headers":[],"bodyText":"x","duration":0.1,"url":"https://x.dev"}"#
+        #expect(try JSONDecoder().decode(ResponseSnapshot.self, from: Data(older.utf8)).redirects.isEmpty)
     }
 }
 

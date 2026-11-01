@@ -373,6 +373,52 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
         #expect(model.activeTab?.bodyNotice == nil)
     }
 
+    @Test func eachNewResponseCanBeSaved() async throws {
+        let harness = Harness()
+        defer { harness.cleanUp() }
+        let model = try harness.model()
+        let tabID = try #require(model.activeTabID)
+        model.update(tabID) { $0.draft.setURL("https://stub.test/ok") }
+        model.send(tabID)
+        try await waitUntilSent(model, tabID: tabID)
+        model.saveActiveResponse()
+        #expect(model.activeTab?.savedResponseID != nil)
+
+        model.send(tabID)
+        try await waitUntilSent(model, tabID: tabID)
+        #expect(model.activeTab?.savedResponseID == nil)
+        model.saveActiveResponse()
+        #expect(model.savedResponses.count == 2)
+    }
+
+    @Test func requestsInAMissingFolderShowOnTheMainList() throws {
+        let harness = Harness()
+        defer { harness.cleanUp() }
+        let model = try harness.model()
+        let folder = model.addFolder(named: "Users")
+        model.save(tabID: try #require(model.activeTabID), name: "Thing", folderID: folder.id)
+        try FileManager.default.removeItem(at: harness.root.appending(path: "folders.json"))
+
+        let reloaded = try harness.model()
+        #expect(reloaded.folders.isEmpty)
+        #expect(reloaded.requests(in: nil).map(\.request.name) == ["Thing"])
+        #expect(reloaded.requests(in: nil).first?.folderID == folder.id)
+    }
+
+    @Test func anUnreadableEnvironmentsFileIsNotReplaced() throws {
+        let harness = Harness()
+        defer { harness.cleanUp() }
+        _ = try harness.model()
+        let file = harness.root.appending(path: "environments.json")
+        try Data("not json".utf8).write(to: file)
+
+        let model = try harness.model()
+        #expect(model.alertMessage?.contains("environments.json") == true)
+        #expect(model.environments.map(\.name) == ["Local"])
+        #expect(String(decoding: try Data(contentsOf: file), as: UTF8.self) == "not json")
+        #expect(FileManager.default.fileExists(atPath: harness.root.appending(path: "environments.json.broken").path))
+    }
+
     @Test func unreadableFilesAreReportedNotDeleted() throws {
         let harness = Harness()
         defer { harness.cleanUp() }
@@ -478,6 +524,41 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
         let vault = try SecretVault(storage: harness.storage)
         #expect(vault.values(for: id).isEmpty)
         #expect(vault.values(for: tabID).isEmpty)
+    }
+
+    @Test func aFailedLoadLeavesSecretsAlone() throws {
+        let harness = Harness()
+        defer { harness.cleanUp() }
+        let model = try harness.model()
+        let tabID = try #require(model.activeTabID)
+        addSecrets(to: model, tabID: tabID)
+        model.save(tabID: tabID, name: "Secure", folderID: nil)
+        let id = try #require(model.savedRequests.first?.id)
+
+        // A file where the requests directory should be makes the whole load fail.
+        let requests = harness.root.appending(path: "requests")
+        try FileManager.default.removeItem(at: requests)
+        try Data().write(to: requests)
+        let broken = try harness.model()
+        #expect(broken.alertMessage != nil)
+        #expect(broken.savedRequests.isEmpty)
+        #expect(try SecretVault(storage: harness.storage).values(for: id)["token"] == "tok-SECRET-123")
+    }
+
+    @Test func anUnreadableRequestKeepsItsSecrets() throws {
+        let harness = Harness()
+        defer { harness.cleanUp() }
+        let model = try harness.model()
+        let tabID = try #require(model.activeTabID)
+        addSecrets(to: model, tabID: tabID)
+        model.save(tabID: tabID, name: "Secure", folderID: nil)
+        let id = try #require(model.savedRequests.first?.id)
+        try Data("not json".utf8).write(to: harness.root.appending(path: "requests/\(id.uuidString).json"))
+
+        let reloaded = try harness.model()
+        #expect(reloaded.savedRequests.isEmpty)
+        #expect(reloaded.alertMessage?.contains(id.uuidString) == true)
+        #expect(try SecretVault(storage: harness.storage).values(for: id)["token"] == "tok-SECRET-123")
     }
 
     @Test func keychainRoundTrip() throws {

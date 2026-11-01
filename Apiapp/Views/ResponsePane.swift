@@ -21,7 +21,12 @@ struct ResponsePane: View {
             }
             .frame(minHeight: 28)
 
-            PaneFrame { content }
+            PaneFrame {
+                if let display = tab.response, !display.snapshot.redirects.isEmpty {
+                    RedirectStrip(snapshot: display.snapshot)
+                }
+                content
+            }
         }
         .padding(.top, 14)
         .padding(.horizontal, 16)
@@ -90,6 +95,32 @@ struct ResponsePane: View {
             get: { tab.responsePane },
             set: { pane in model.update(tab.id) { $0.responsePane = pane } }
         )
+    }
+}
+
+/// Says where a redirected request ended up, since the URL field still shows where it started.
+private struct RedirectStrip: View {
+    let snapshot: ResponseSnapshot
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.turn.down.right")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Theme.secondary)
+            Text(snapshot.redirectSummary)
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+                .help(snapshot.url)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 30)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(Theme.hairline).frame(height: 1)
+        }
     }
 }
 

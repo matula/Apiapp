@@ -91,6 +91,16 @@ enum RequestBuilder {
         return request
     }
 
+    /// The headers that carry credentials. The runner lets them follow a redirect to the
+    /// same origin only, as curl does.
+    static func credentialHeaderNames(for draft: RequestDraft, variables: [String: String]) -> Set<String> {
+        var names: Set<String> = ["Authorization"]
+        if draft.auth.kind == .apiKey, draft.auth.apiKeyPlacement == .header {
+            names.insert(VariableResolver.resolve(draft.auth.apiKeyName, values: variables))
+        }
+        return names
+    }
+
     private static func setHeader(_ headers: inout [(name: String, value: String)], _ name: String, _ value: String) {
         headers.removeAll { $0.name.caseInsensitiveCompare(name) == .orderedSame }
         headers.append((name, value))

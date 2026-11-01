@@ -5,15 +5,22 @@ import Testing
 /// Sends through the real networking stack to a loopback server, to check what
 /// actually leaves the machine.
 @Suite(.serialized) struct WireTests {
-    private func send(_ draft: RequestDraft) async throws -> (raw: String, display: ResponseDisplay) {
+    /// Sends to the echo server. With `redirectingTo`, the request goes to a path the
+    /// server answers with a 302 to that URL, so the echo comes from wherever it points.
+    private func send(
+        _ draft: RequestDraft,
+        redirectingTo location: ((UInt16) -> String)? = nil
+    ) async throws -> (raw: String, display: ResponseDisplay) {
         let server = try LocalEchoServer()
         let port = try await server.start()
         defer { server.stop() }
+        server.redirectLocation = location?(port)
 
         var draft = draft
-        draft.setURL("http://127.0.0.1:\(port)/v1/users?page=1")
+        draft.setURL("http://127.0.0.1:\(port)\(location == nil ? "/v1/users?page=1" : "/redirect")")
         let request = try RequestBuilder.build(draft, variables: [:])
-        let display = try await RequestRunner().send(request)
+        let credentialHeaders = RequestBuilder.credentialHeaderNames(for: draft, variables: [:])
+        let display = try await RequestRunner().send(request, credentialHeaders: credentialHeaders)
         let raw = try JSONDecoder().decode(String.self, from: display.snapshot.body)
         return (raw, display)
     }
@@ -43,6 +50,7 @@ import Testing
         #expect(display.snapshot.reason == "Created")
         #expect(display.snapshot.headers.contains(HeaderField(name: "X-Echo", value: "yes")))
         #expect(display.snapshot.duration > 0)
+        #expect(display.snapshot.redirects.isEmpty)
     }
 
     @Test func removingContentTypeOnPOSTStopsTheFormDefault() async throws {
@@ -85,5 +93,32 @@ import Testing
         let (raw, _) = try await send(draft)
         #expect(contentTypeLine(raw)?.hasPrefix("content-type: multipart/form-data; boundary=") == true)
         #expect(raw.contains(#"name="title""#))
+    }
+
+    @Test func sameOriginRedirectKeepsCredentials() async throws {
+        var draft = jsonPost()
+        draft.auth.kind = .bearer
+        draft.auth.token = "abc123"
+        let (raw, display) = try await send(draft, redirectingTo: { "http://127.0.0.1:\($0)/v1/after" })
+        #expect(raw.hasPrefix("GET /v1/after HTTP/1.1\r\n"))
+        #expect(raw.contains("Bearer abc123"))
+        #expect(display.snapshot.redirects.map(\.statusCode) == [302])
+        #expect(display.snapshot.url.hasSuffix("/v1/after"))
+        #expect(display.snapshot.redirectSummary.hasPrefix("Redirected (302) to http://127.0.0.1:"))
+    }
+
+    /// `localhost` and `127.0.0.1` are the same machine but different origins.
+    @Test func crossOriginRedirectDropsOnlyTheCredentials() async throws {
+        var draft = jsonPost()
+        draft.auth.kind = .apiKey
+        draft.auth.apiKeyValue = "k-SECRET"
+        draft.headers.append(KeyValue(key: "Authorization", value: "Bearer typed-SECRET"))
+        draft.headers.append(KeyValue(key: "X-Plain", value: "stays"))
+        let (raw, display) = try await send(draft, redirectingTo: { "http://localhost:\($0)/v1/after" })
+        #expect(raw.hasPrefix("GET /v1/after HTTP/1.1\r\n"))
+        #expect(!raw.contains("SECRET"))
+        #expect(headerLines(raw).contains("x-plain: stays"))
+        #expect(display.snapshot.url.hasPrefix("http://localhost:"))
+        #expect(display.snapshot.redirects.count == 1)
     }
 }

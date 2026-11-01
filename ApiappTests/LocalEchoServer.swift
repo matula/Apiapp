@@ -7,6 +7,10 @@ final class LocalEchoServer: @unchecked Sendable {
     private let listener: NWListener
     private let queue = DispatchQueue(label: "LocalEchoServer")
 
+    /// Set before sending. A request whose path starts with `/redirect` is answered with
+    /// a 302 to this URL instead of an echo.
+    var redirectLocation: String?
+
     init() throws {
         let parameters = NWParameters.tcp
         parameters.requiredInterfaceType = .loopback
@@ -63,9 +67,16 @@ final class LocalEchoServer: @unchecked Sendable {
     }
 
     private func reply(to request: Data, on connection: NWConnection) {
-        let body = (try? JSONEncoder().encode(String(decoding: request, as: UTF8.self))) ?? Data()
-        var response = Data("HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nX-Echo: yes\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8)
-        response.append(body)
+        let text = String(decoding: request, as: UTF8.self)
+        let path = text.prefix { $0 != "\r" }.split(separator: " ").dropFirst().first ?? ""
+        var response: Data
+        if let location = redirectLocation, path.hasPrefix("/redirect") {
+            response = Data("HTTP/1.1 302 Found\r\nLocation: \(location)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8)
+        } else {
+            let body = (try? JSONEncoder().encode(text)) ?? Data()
+            response = Data("HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nX-Echo: yes\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8)
+            response.append(body)
+        }
         connection.send(content: response, completion: .contentProcessed { _ in connection.cancel() })
     }
 }

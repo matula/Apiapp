@@ -20,7 +20,8 @@ struct TopBar: View {
                 }
                 .scrollIndicators(.never)
                 .onChange(of: model.activeTabID, initial: true) {
-                    proxy.scrollTo(model.activeTabID)
+                    // Pills are registered under a UUID, and an Optional wrapping one doesn't match it.
+                    if let id = model.activeTabID { proxy.scrollTo(id) }
                 }
             }
 
