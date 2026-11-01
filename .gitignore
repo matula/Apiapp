@@ -1,0 +1,38 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Build output
+build/
+DerivedData/
+*.xcresult
+*.xcarchive
+*.dSYM
+*.dSYM.zip
+*.app
+*.ipa
+
+# Xcode per-user state (shared schemes in xcshareddata stay tracked)
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+*.moved-aside
+*.hmap
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Local settings and secrets
+.env
+.env.*
+*.local
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
