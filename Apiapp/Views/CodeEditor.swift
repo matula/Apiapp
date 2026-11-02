@@ -89,7 +89,6 @@ struct CodeEditor: NSViewRepresentable {
             let everything = NSRange(location: 0, length: (textView.string as NSString).length)
             guard textView.shouldChangeText(in: everything, replacementString: text) else { return }
             textView.textStorage?.replaceCharacters(in: everything, with: NSAttributedString(string: text, attributes: Coordinator.baseAttributes))
-            coordinator.lastText = text
             textView.didChangeText()
         } else {
             coordinator.replaceAll(in: textView, with: text)
@@ -115,6 +114,12 @@ struct CodeEditor: NSViewRepresentable {
         var language: CodeLanguage
         var lastText = ""
         weak var ruler: LineNumberRuler?
+        /// The text that the next change replaces, noted before it happens, so that only
+        /// that part of the document needs colouring again afterwards.
+        private var pendingEdits: [(range: NSRange, replacementLength: Int)] = []
+        private var isWholeDocumentColoured = false
+        /// Whether the last colouring pass covered only the lines around an edit.
+        private(set) var lastPassWasPartial = false
 
         init(text: Binding<String>, language: CodeLanguage) {
             self.text = text
@@ -129,14 +134,41 @@ struct CodeEditor: NSViewRepresentable {
             ruler?.textDidChange()
         }
 
+        /// Colours the whole document.
         func highlight(_ textView: NSTextView) {
             guard let layoutManager = textView.layoutManager else { return }
             let length = (textView.string as NSString).length
-            let everything = NSRange(location: 0, length: length)
-            layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: everything)
-            guard length <= CodeEditor.highlightLimit else { return }
-            for token in SyntaxHighlighter.tokens(in: textView.string, language: language) {
-                layoutManager.addTemporaryAttribute(.foregroundColor, value: Self.color(for: token.kind), forCharacterRange: token.range)
+            layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: NSRange(location: 0, length: length))
+            lastPassWasPartial = false
+            isWholeDocumentColoured = length <= CodeEditor.highlightLimit
+            guard isWholeDocumentColoured else { return }
+            apply(SyntaxHighlighter.tokens(in: textView.string, language: language), offset: 0, to: layoutManager)
+        }
+
+        /// Colours only the lines around one edit, which is all that can have changed: no
+        /// token crosses a line, except that a key is known by the colon after it, which may
+        /// sit on the next line. One extra line each way covers that.
+        func highlight(_ textView: NSTextView, around changed: NSRange) {
+            guard let layoutManager = textView.layoutManager else { return }
+            let string = textView.string as NSString
+            guard isWholeDocumentColoured, string.length <= CodeEditor.highlightLimit else {
+                highlight(textView)
+                return
+            }
+            let location = min(changed.location, string.length)
+            let edited = string.paragraphRange(for: NSRange(location: location, length: min(changed.length, string.length - location)))
+            let start = max(edited.location - 1, 0)
+            let end = min(NSMaxRange(edited) + 1, string.length)
+            let range = string.paragraphRange(for: NSRange(location: start, length: end - start))
+            layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: range)
+            apply(SyntaxHighlighter.tokens(in: string.substring(with: range), language: language), offset: range.location, to: layoutManager)
+            lastPassWasPartial = true
+        }
+
+        private func apply(_ tokens: [SyntaxToken], offset: Int, to layoutManager: NSLayoutManager) {
+            for token in tokens {
+                let range = NSRange(location: token.range.location + offset, length: token.range.length)
+                layoutManager.addTemporaryAttribute(.foregroundColor, value: Self.color(for: token.kind), forCharacterRange: range)
             }
         }
 
@@ -150,13 +182,40 @@ struct CodeEditor: NSViewRepresentable {
             }
         }
 
+        func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
+            if let replacementString {
+                pendingEdits.append((affectedCharRange, (replacementString as NSString).length))
+            }
+            return true
+        }
+
+        func textView(_ textView: NSTextView, shouldChangeTextInRanges affectedRanges: [NSValue], replacementStrings: [String]?) -> Bool {
+            if let replacementStrings {
+                for (range, string) in zip(affectedRanges, replacementStrings) {
+                    pendingEdits.append((range.rangeValue, (string as NSString).length))
+                }
+            }
+            return true
+        }
+
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
+            let edits = pendingEdits
+            pendingEdits = []
+            let oldLength = lastText.utf16.count
             let newText = textView.string
             lastText = newText
             if text.wrappedValue != newText { text.wrappedValue = newText }
-            highlight(textView)
-            ruler?.textDidChange()
+            // One edit that accounts for the whole change in length can be handled on its
+            // own. Anything else, which is rare, gets a full pass.
+            if edits.count == 1, newText.utf16.count - oldLength == edits[0].replacementLength - edits[0].range.length {
+                let edit = edits[0]
+                highlight(textView, around: NSRange(location: edit.range.location, length: edit.replacementLength))
+                ruler?.textDidChange(replacing: edit.range, withLength: edit.replacementLength)
+            } else {
+                highlight(textView)
+                ruler?.textDidChange()
+            }
         }
 
         func textView(_ textView: NSTextView, doCommandBy selector: Selector) -> Bool {
@@ -226,7 +285,8 @@ final class LineNumberRuler: NSRulerView {
     ]
 
     private weak var textView: NSTextView?
-    private var lineStarts: [Int] = [0]
+    /// Where each line begins, as a UTF-16 offset. A start is the index just after a newline.
+    private(set) var lineStarts: [Int] = [0]
 
     init(textView: NSTextView, scrollView: NSScrollView) {
         self.textView = textView
@@ -240,6 +300,7 @@ final class LineNumberRuler: NSRulerView {
         fatalError("init(coder:) is not used")
     }
 
+    /// Recomputes every line start.
     func textDidChange() {
         guard let textView else { return }
         let string = textView.string as NSString
@@ -252,6 +313,29 @@ final class LineNumberRuler: NSRulerView {
             starts.append(location)
         }
         lineStarts = starts
+        needsDisplay = true
+    }
+
+    /// Updates the line starts for one edit without rescanning the rest of the text. The
+    /// starts inside the replaced text go, and the ones after it move by however much the
+    /// length changed.
+    func textDidChange(replacing old: NSRange, withLength newLength: Int) {
+        guard let textView else { return }
+        let string = textView.string as NSString
+        let location = min(old.location, string.length)
+        let newEnd = min(location + newLength, string.length)
+        let delta = newLength - old.length
+        let before = lineStarts.prefix { $0 <= location }
+        let after = lineStarts.drop { $0 <= NSMaxRange(old) }.map { $0 + delta }
+        var inserted: [Int] = []
+        var cursor = location
+        while cursor < newEnd {
+            let range = string.range(of: "\n", options: .literal, range: NSRange(location: cursor, length: newEnd - cursor))
+            guard range.location != NSNotFound else { break }
+            cursor = NSMaxRange(range)
+            inserted.append(cursor)
+        }
+        lineStarts = Array(before) + inserted + Array(after)
         needsDisplay = true
     }
 

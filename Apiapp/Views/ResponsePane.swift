@@ -63,7 +63,7 @@ struct ResponsePane: View {
     @ViewBuilder private var content: some View {
         switch tab.phase {
         case .idle:
-            PlaceholderText("Send a request to see the response here.")
+            PlaceholderText(tab.savedResponseID == nil ? "Send a request to see the response here." : "Opening the saved response…")
         case .sending:
             PlaceholderText("Waiting for the server…")
         case .cancelled:

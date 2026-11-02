@@ -28,7 +28,15 @@ struct Harness {
     let root = FileManager.default.temporaryDirectory.appending(path: "ApiappTests-\(UUID().uuidString)", directoryHint: .isDirectory)
     let storage = InMemorySecretStorage()
 
-    func model() throws -> AppModel {
+    /// A model that has read everything from disk.
+    func model() async throws -> AppModel {
+        let model = try unloadedModel()
+        await model.load()
+        return model
+    }
+
+    /// A model before it reads anything, for tests of what happens in the meantime.
+    func unloadedModel() throws -> AppModel {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [StubProtocol.self]
         return AppModel(store: Store(root: root), vault: try SecretVault(storage: storage), runner: RequestRunner(configuration: configuration))
@@ -55,19 +63,25 @@ struct Harness {
 
 @MainActor
 private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
+    try await waitUntil("the request to finish") { model.tabs.first(where: { $0.id == tabID })?.isSending == false }
+}
+
+/// Polls for up to five seconds.
+@MainActor
+private func waitUntil(_ what: String, _ condition: () throws -> Bool) async throws {
     for _ in 0..<500 {
-        if model.tabs.first(where: { $0.id == tabID })?.isSending == false { return }
+        if try condition() { return }
         try await Task.sleep(for: .milliseconds(10))
     }
-    Issue.record("Timed out waiting for the request")
+    Issue.record("Timed out waiting for \(what)")
 }
 
 @MainActor
 @Suite struct AppModelTests {
-    @Test func startsWithOneBlankTabAndALocalEnvironment() throws {
+    @Test func startsWithOneBlankTabAndALocalEnvironment() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         #expect(model.tabs.count == 1)
         #expect(model.activeTab?.draft.bodyType == .json)
         #expect(model.activeEnvironment?.name == "Local")
@@ -77,7 +91,7 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
     @Test func sendingRecordsHistoryIncludingTheBody() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         let tabID = try #require(model.activeTabID)
         model.update(tabID) {
             $0.draft.method = .post
@@ -94,7 +108,7 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
         #expect(model.history[0].statusCode == 200)
         #expect(harness.files(in: "history").count == 1)
 
-        let reloaded = try harness.model()
+        let reloaded = try await harness.model()
         #expect(reloaded.history.first?.request.bodyText == #"{"name":"Ada"}"#)
         #expect(reloaded.history.first?.statusCode == 200)
     }
@@ -102,7 +116,7 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
     @Test func failedRequestsStillGoInHistory() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         let tabID = try #require(model.activeTabID)
         model.update(tabID) { $0.draft.setURL("https://stub.test/down") }
         model.send(tabID)
@@ -116,10 +130,10 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
         #expect(model.history[0].statusCode == nil)
     }
 
-    @Test func requestsThatNeverLeftAreNotInHistory() throws {
+    @Test func requestsThatNeverLeftAreNotInHistory() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         let tabID = try #require(model.activeTabID)
         model.update(tabID) { $0.draft.setURL("{{nope}}/x") }
         model.send(tabID)
@@ -134,7 +148,7 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
     @Test func sendingAgainCancels() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         let tabID = try #require(model.activeTabID)
         model.update(tabID) { $0.draft.setURL("https://stub.test/hang") }
         model.send(tabID)
@@ -147,7 +161,7 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
     @Test func historyIsCapped() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         let tabID = try #require(model.activeTabID)
         model.update(tabID) { $0.draft.setURL("https://stub.test/ok") }
         for _ in 0..<(AppModel.historyLimit + 3) {
@@ -161,7 +175,7 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
     @Test func clickingHistoryOpensATabWithEverythingAndItCanBeSaved() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         let tabID = try #require(model.activeTabID)
         model.update(tabID) {
             $0.draft.method = .put
@@ -189,10 +203,10 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
         #expect(model.activeTab?.savedRequestID == model.savedRequests.first?.id)
     }
 
-    @Test func savesToAFolderOrTheMainList() throws {
+    @Test func savesToAFolderOrTheMainList() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         let tabID = try #require(model.activeTabID)
         let folder = model.addFolder(named: "Users")
 
@@ -203,15 +217,15 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
         #expect(model.requests(in: folder.id).map(\.request.name) == ["In folder"])
         #expect(model.requests(in: nil).map(\.request.name) == ["On list"])
 
-        let reloaded = try harness.model()
+        let reloaded = try await harness.model()
         #expect(reloaded.folders.map(\.name) == ["Users"])
         #expect(reloaded.requests(in: folder.id).map(\.request.name) == ["In folder"])
     }
 
-    @Test func saveUpdatesAnAlreadySavedRequest() throws {
+    @Test func saveUpdatesAnAlreadySavedRequest() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         let tabID = try #require(model.activeTabID)
         model.save(tabID: tabID, name: "Thing", folderID: nil)
 
@@ -222,21 +236,21 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
         #expect(model.saveTarget == nil)
         #expect(model.activeTab?.isDirty == false)
         #expect(model.savedRequests.count == 1)
-        #expect(try harness.model().savedRequests.first?.request.url == "https://x.dev/new")
+        #expect(try await harness.model().savedRequests.first?.request.url == "https://x.dev/new")
     }
 
-    @Test func saveAsksWhereForANewRequest() throws {
+    @Test func saveAsksWhereForANewRequest() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         model.saveActiveTab()
         #expect(model.saveTarget?.id == model.activeTabID)
     }
 
-    @Test func openingASavedRequestTwiceReusesItsTab() throws {
+    @Test func openingASavedRequestTwiceReusesItsTab() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         model.save(tabID: try #require(model.activeTabID), name: "Thing", folderID: nil)
         let id = try #require(model.savedRequests.first?.id)
         model.newTab()
@@ -245,25 +259,25 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
         #expect(model.activeSidebarItem == .saved(id))
     }
 
-    @Test func movingARequestUpdatesItsFolder() throws {
+    @Test func movingARequestUpdatesItsFolder() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         let folder = model.addFolder(named: "Users")
         model.save(tabID: try #require(model.activeTabID), name: "Thing", folderID: nil)
         let id = try #require(model.savedRequests.first?.id)
 
         model.move(savedRequest: id, to: folder.id)
-        #expect(try harness.model().requests(in: folder.id).map(\.request.name) == ["Thing"])
+        #expect(try await harness.model().requests(in: folder.id).map(\.request.name) == ["Thing"])
 
         model.move(savedRequest: id, to: nil)
-        #expect(try harness.model().requests(in: nil).map(\.request.name) == ["Thing"])
+        #expect(try await harness.model().requests(in: nil).map(\.request.name) == ["Thing"])
     }
 
-    @Test func duplicatingAndRenamingARequest() throws {
+    @Test func duplicatingAndRenamingARequest() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         model.save(tabID: try #require(model.activeTabID), name: "Thing", folderID: nil)
         let id = try #require(model.savedRequests.first?.id)
 
@@ -275,10 +289,10 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
         #expect(model.activeTab?.isDirty == false)
     }
 
-    @Test func deletingAFolderKeepsItsRequests() throws {
+    @Test func deletingAFolderKeepsItsRequests() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         let folder = model.addFolder(named: "Users")
         model.save(tabID: try #require(model.activeTabID), name: "Thing", folderID: folder.id)
         model.delete(folder: folder.id)
@@ -286,10 +300,10 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
         #expect(model.requests(in: nil).map(\.request.name) == ["Thing"])
     }
 
-    @Test func deletingASavedRequestLeavesItsTabOpenButUnsaved() throws {
+    @Test func deletingASavedRequestLeavesItsTabOpenButUnsaved() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         model.save(tabID: try #require(model.activeTabID), name: "Thing", folderID: nil)
         let id = try #require(model.savedRequests.first?.id)
         model.delete(savedRequest: id)
@@ -300,7 +314,7 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
     @Test func savedResponsesKeepTheRequestAndBody() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         let tabID = try #require(model.activeTabID)
         model.update(tabID) { $0.draft.setURL("https://stub.test/ok") }
         model.send(tabID)
@@ -308,33 +322,34 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
         model.saveActiveResponse()
         #expect(model.activeTab?.savedResponseID != nil)
 
-        let reloaded = try harness.model()
+        let reloaded = try await harness.model()
         let saved = try #require(reloaded.savedResponses.first)
         #expect(saved.response.body == Data(#"{"ok":true}"#.utf8))
         reloaded.openSavedResponse(saved.id)
+        try await waitUntil("the saved response to open") { reloaded.activeTab?.response != nil }
         #expect(reloaded.activeTab?.response?.bodyText == "{\n  \"ok\": true\n}")
         #expect(reloaded.activeTab?.draft.url == "https://stub.test/ok")
     }
 
-    @Test func tabsComeBackAfterRelaunch() throws {
+    @Test func tabsComeBackAfterRelaunch() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         let tabID = try #require(model.activeTabID)
         model.update(tabID) { $0.draft.setURL("https://x.dev/unsaved") }
         model.newTab()
         model.update(try #require(model.activeTabID)) { $0.draft.setURL("https://x.dev/second") }
         model.saveWorkspace()
 
-        let reloaded = try harness.model()
+        let reloaded = try await harness.model()
         #expect(reloaded.tabs.map(\.draft.url) == ["https://x.dev/unsaved", "https://x.dev/second"])
         #expect(reloaded.activeTab?.draft.url == "https://x.dev/second")
     }
 
-    @Test func closingTheLastTabLeavesABlankOne() throws {
+    @Test func closingTheLastTabLeavesABlankOne() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         model.close(try #require(model.activeTabID))
         #expect(model.tabs.count == 1)
         #expect(model.activeTab != nil)
@@ -343,7 +358,7 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
     @Test func closingAskOnlyWhenWorkWouldBeLost() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         let tabID = try #require(model.activeTabID)
         model.update(tabID) { $0.draft.setURL("https://stub.test/ok") }
 
@@ -357,10 +372,10 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
         #expect(model.tabPendingClose == nil)
     }
 
-    @Test func formatReportsErrorsWithoutChangingTheBody() throws {
+    @Test func formatReportsErrorsWithoutChangingTheBody() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         let tabID = try #require(model.activeTabID)
         model.update(tabID) { $0.draft.bodyText = "{oops" }
         model.formatActiveBody()
@@ -376,7 +391,7 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
     @Test func eachNewResponseCanBeSaved() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         let tabID = try #require(model.activeTabID)
         model.update(tabID) { $0.draft.setURL("https://stub.test/ok") }
         model.send(tabID)
@@ -391,42 +406,110 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
         #expect(model.savedResponses.count == 2)
     }
 
-    @Test func requestsInAMissingFolderShowOnTheMainList() throws {
+    @Test func requestsInAMissingFolderShowOnTheMainList() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         let folder = model.addFolder(named: "Users")
         model.save(tabID: try #require(model.activeTabID), name: "Thing", folderID: folder.id)
         try FileManager.default.removeItem(at: harness.root.appending(path: "folders.json"))
 
-        let reloaded = try harness.model()
+        let reloaded = try await harness.model()
         #expect(reloaded.folders.isEmpty)
         #expect(reloaded.requests(in: nil).map(\.request.name) == ["Thing"])
         #expect(reloaded.requests(in: nil).first?.folderID == folder.id)
     }
 
-    @Test func anUnreadableEnvironmentsFileIsNotReplaced() throws {
+    @Test func anUnreadableEnvironmentsFileIsNotReplaced() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        _ = try harness.model()
+        _ = try await harness.model()
         let file = harness.root.appending(path: "environments.json")
         try Data("not json".utf8).write(to: file)
 
-        let model = try harness.model()
+        let model = try await harness.model()
         #expect(model.alertMessage?.contains("environments.json") == true)
         #expect(model.environments.map(\.name) == ["Local"])
         #expect(String(decoding: try Data(contentsOf: file), as: UTF8.self) == "not json")
         #expect(FileManager.default.fileExists(atPath: harness.root.appending(path: "environments.json.broken").path))
     }
 
-    @Test func unreadableFilesAreReportedNotDeleted() throws {
+    @Test func tabsOpenedWhileLoadingAreKept() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        _ = try harness.model()
+        let first = try await harness.model()
+        first.update(try #require(first.activeTabID)) { $0.draft.setURL("https://x.dev/restored") }
+        first.saveWorkspace()
+
+        let model = try harness.unloadedModel()
+        #expect(model.isLoading)
+        model.newTab()
+        await model.load()
+        #expect(!model.isLoading)
+        #expect(model.tabs.map(\.draft.url) == ["https://x.dev/restored", ""])
+        #expect(model.activeTab?.draft.url == "")
+    }
+
+    @Test func editsAreWrittenInTheBackground() async throws {
+        let harness = Harness()
+        defer { harness.cleanUp() }
+        let model = try await harness.model()
+        model.update(try #require(model.activeTabID)) { $0.draft.setURL("https://x.dev/later") }
+        let store = Store(root: harness.root)
+        try await waitUntil("the edit to reach the workspace file") {
+            try store.load().workspace.tabs.first?.draft.url == "https://x.dev/later"
+        }
+    }
+
+    @Test func anOlderWorkspaceWriteNeverLandsOverANewerOne() throws {
+        let harness = Harness()
+        defer { harness.cleanUp() }
+        let store = Store(root: harness.root)
+        try store.prepare()
+        let writer = WorkspaceWriter(store: store)
+        var newer = WorkspaceState()
+        newer.activeTabID = UUID()
+        try writer.write(newer, version: 2)
+        try writer.write(WorkspaceState(), version: 1)
+        #expect(try store.load().workspace == newer)
+    }
+
+    @Test func multipartUploadsAreReadAwayFromTheMainThread() async throws {
+        let harness = Harness()
+        defer { harness.cleanUp() }
+        let model = try await harness.model()
+        let file = harness.root.appending(path: "upload.txt")
+        try Data("file text".utf8).write(to: file)
+        let tabID = try #require(model.activeTabID)
+        model.update(tabID) {
+            $0.draft.method = .post
+            $0.draft.setURL("https://stub.test/upload")
+            $0.draft.setBodyType(.multipart)
+            $0.draft.multipartFields = [MultipartField(key: "upload", value: file.path, kind: .file)]
+        }
+        model.send(tabID)
+        try await waitUntilSent(model, tabID: tabID)
+        #expect(model.activeTab?.response?.snapshot.statusCode == 200)
+        #expect(model.history.count == 1)
+
+        try FileManager.default.removeItem(at: file)
+        model.send(tabID)
+        guard case .failed(let message) = model.activeTab?.phase else {
+            Issue.record("Expected the missing file to be reported")
+            return
+        }
+        #expect(message.contains("upload.txt"))
+        #expect(model.history.count == 1)
+    }
+
+    @Test func unreadableFilesAreReportedNotDeleted() async throws {
+        let harness = Harness()
+        defer { harness.cleanUp() }
+        _ = try await harness.model()
         let bad = harness.root.appending(path: "requests/broken.json")
         try Data("not json".utf8).write(to: bad)
 
-        let model = try harness.model()
+        let model = try await harness.model()
         #expect(model.alertMessage?.contains("broken.json") == true)
         #expect(FileManager.default.fileExists(atPath: bad.path))
     }
@@ -445,7 +528,7 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
     @Test func tokensStayOutOfEveryFile() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         let tabID = try #require(model.activeTabID)
         addSecrets(to: model, tabID: tabID)
 
@@ -464,7 +547,7 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
     @Test func tokensComeBackFromTheVault() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         let tabID = try #require(model.activeTabID)
         addSecrets(to: model, tabID: tabID)
         model.save(tabID: tabID, name: "Secure", folderID: nil)
@@ -472,17 +555,17 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
         try await waitUntilSent(model, tabID: tabID)
         model.saveWorkspace()
 
-        let reloaded = try harness.model()
+        let reloaded = try await harness.model()
         #expect(reloaded.savedRequests.first?.request.auth.token == "tok-SECRET-123")
         #expect(reloaded.history.first?.request.auth.token == "tok-SECRET-123")
         #expect(reloaded.activeTab?.draft.auth.token == "tok-SECRET-123")
         #expect(reloaded.activeTab?.isDirty == false)
     }
 
-    @Test func variableReferencesStayInTheFile() throws {
+    @Test func variableReferencesStayInTheFile() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         let tabID = try #require(model.activeTabID)
         model.update(tabID) {
             $0.draft.auth.kind = .bearer
@@ -490,13 +573,13 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
         }
         model.save(tabID: tabID, name: "Ref", folderID: nil)
         #expect(try harness.allFileText().contains("{{token}}"))
-        #expect(try harness.model().savedRequests.first?.request.auth.token == "{{token}}")
+        #expect(try await harness.model().savedRequests.first?.request.auth.token == "{{token}}")
     }
 
-    @Test func secretVariablesStayOutOfTheEnvironmentsFile() throws {
+    @Test func secretVariablesStayOutOfTheEnvironmentsFile() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         var environments = model.environments
         environments[0].variables.append(Variable(key: "token", value: "var-SECRET-456", isSecret: true))
         environments[0].variables.append(Variable(key: "plain", value: "visible-value"))
@@ -506,14 +589,14 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
         #expect(!text.contains("var-SECRET-456"))
         #expect(text.contains("visible-value"))
 
-        let reloaded = try harness.model()
+        let reloaded = try await harness.model()
         #expect(reloaded.activeEnvironment?.resolvedValues["token"] == "var-SECRET-456")
     }
 
-    @Test func deletingThingsRemovesTheirSecrets() throws {
+    @Test func deletingThingsRemovesTheirSecrets() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         let tabID = try #require(model.activeTabID)
         addSecrets(to: model, tabID: tabID)
         model.save(tabID: tabID, name: "Secure", folderID: nil)
@@ -526,10 +609,10 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
         #expect(vault.values(for: tabID).isEmpty)
     }
 
-    @Test func aFailedLoadLeavesSecretsAlone() throws {
+    @Test func aFailedLoadLeavesSecretsAlone() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         let tabID = try #require(model.activeTabID)
         addSecrets(to: model, tabID: tabID)
         model.save(tabID: tabID, name: "Secure", folderID: nil)
@@ -539,29 +622,36 @@ private func waitUntilSent(_ model: AppModel, tabID: UUID) async throws {
         let requests = harness.root.appending(path: "requests")
         try FileManager.default.removeItem(at: requests)
         try Data().write(to: requests)
-        let broken = try harness.model()
+        let broken = try await harness.model()
         #expect(broken.alertMessage != nil)
         #expect(broken.savedRequests.isEmpty)
         #expect(try SecretVault(storage: harness.storage).values(for: id)["token"] == "tok-SECRET-123")
     }
 
-    @Test func anUnreadableRequestKeepsItsSecrets() throws {
+    @Test func anUnreadableRequestKeepsItsSecrets() async throws {
         let harness = Harness()
         defer { harness.cleanUp() }
-        let model = try harness.model()
+        let model = try await harness.model()
         let tabID = try #require(model.activeTabID)
         addSecrets(to: model, tabID: tabID)
         model.save(tabID: tabID, name: "Secure", folderID: nil)
         let id = try #require(model.savedRequests.first?.id)
         try Data("not json".utf8).write(to: harness.root.appending(path: "requests/\(id.uuidString).json"))
 
-        let reloaded = try harness.model()
+        let reloaded = try await harness.model()
         #expect(reloaded.savedRequests.isEmpty)
         #expect(reloaded.alertMessage?.contains(id.uuidString) == true)
         #expect(try SecretVault(storage: harness.storage).values(for: id)["token"] == "tok-SECRET-123")
     }
 
-    @Test func keychainRoundTrip() throws {
+    @Test func aCorruptVaultIsNotTreatedAsEmpty() {
+        let storage = InMemorySecretStorage()
+        storage.data = Data("not json".utf8)
+        #expect(throws: SecretVaultError.self) { try SecretVault(storage: storage) }
+        #expect(storage.data == Data("not json".utf8))
+    }
+
+    @Test func keychainRoundTrip() async throws {
         let storage = KeychainSecretStorage(service: "local.apiapp.mac.tests.\(UUID().uuidString)")
         defer { try? storage.delete() }
         #expect(try storage.load() == nil)

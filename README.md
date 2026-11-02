@@ -58,3 +58,4 @@ A file that can't be read is skipped and reported at launch, and a copy ending i
 - **No cookies are kept** between requests, and responses aren't cached, so each send contains exactly what the tab shows.
 - **Redirects are followed**, and the response pane says where the request ended up. Credentials from the Auth tab, and any `Authorization` header, go along only to the same scheme, host and port; a redirect anywhere else is sent without them. Other headers follow every redirect, so an API key that shouldn't belongs in the Auth tab rather than the Headers table.
 - **A `+` in a query string** fills the Params table as a space, which is how servers read it. A plus sign typed in the table is sent as `%2B`.
+- **Responses over 50 MB are refused**, with a message saying so, rather than held in memory and handed to the text view. Save a response that size to a file with `curl -o` instead.

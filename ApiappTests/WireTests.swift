@@ -9,18 +9,21 @@ import Testing
     /// server answers with a 302 to that URL, so the echo comes from wherever it points.
     private func send(
         _ draft: RequestDraft,
-        redirectingTo location: ((UInt16) -> String)? = nil
+        redirectingTo location: ((UInt16) -> String)? = nil,
+        runner: RequestRunner = RequestRunner(),
+        omittingContentLength: Bool = false
     ) async throws -> (raw: String, display: ResponseDisplay) {
         let server = try LocalEchoServer()
         let port = try await server.start()
         defer { server.stop() }
         server.redirectLocation = location?(port)
+        server.omitsContentLength = omittingContentLength
 
         var draft = draft
         draft.setURL("http://127.0.0.1:\(port)\(location == nil ? "/v1/users?page=1" : "/redirect")")
         let request = try RequestBuilder.build(draft, variables: [:])
         let credentialHeaders = RequestBuilder.credentialHeaderNames(for: draft, variables: [:])
-        let display = try await RequestRunner().send(request, credentialHeaders: credentialHeaders)
+        let display = try await runner.send(request, credentialHeaders: credentialHeaders)
         let raw = try JSONDecoder().decode(String.self, from: display.snapshot.body)
         return (raw, display)
     }
@@ -120,5 +123,27 @@ import Testing
         #expect(headerLines(raw).contains("x-plain: stays"))
         #expect(display.snapshot.url.hasPrefix("http://localhost:"))
         #expect(display.snapshot.redirects.count == 1)
+    }
+
+    @Test func refusesABodyAnnouncedAsOverTheLimit() async throws {
+        var draft = jsonPost()
+        draft.bodyText = String(repeating: "x", count: 4096)
+        await #expect(throws: ResponseError.tooLarge(limit: 1024)) {
+            try await send(draft, runner: RequestRunner(maximumBodySize: 1024))
+        }
+    }
+
+    @Test func refusesABodyThatGrowsPastTheLimit() async throws {
+        var draft = jsonPost()
+        draft.bodyText = String(repeating: "x", count: 4096)
+        await #expect(throws: ResponseError.tooLarge(limit: 1024)) {
+            try await send(draft, runner: RequestRunner(maximumBodySize: 1024), omittingContentLength: true)
+        }
+    }
+
+    @Test func theLimitLeavesSmallerBodiesAlone() async throws {
+        let (raw, display) = try await send(jsonPost(), runner: RequestRunner(maximumBodySize: 1024 * 1024), omittingContentLength: true)
+        #expect(raw.hasSuffix(#"{"name":"Ada"}"#))
+        #expect(display.snapshot.statusCode == 201)
     }
 }

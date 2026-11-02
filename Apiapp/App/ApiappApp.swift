@@ -4,26 +4,32 @@ import SwiftUI
 @main
 struct ApiappApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @State private var model = AppModel.live()
 
     var body: some Scene {
         Window("Apiapp", id: "main") {
             ContentView()
-                .environment(model)
+                .environment(appDelegate.model)
                 .frame(minWidth: 900, minHeight: 600)
-                .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
-                    model.saveWorkspace()
-                }
         }
         .defaultSize(width: 1280, height: 820)
         .windowStyle(.hiddenTitleBar)
-        .commands { AppCommands(model: model) }
+        .commands { AppCommands(model: appDelegate.model) }
     }
 }
 
+/// Owns the model, so that the last save can happen here when the app quits. A view's
+/// notification handler might already be gone by then.
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    let model = AppModel.live()
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        model.saveWorkspace()
+        return .terminateNow
     }
 }
 

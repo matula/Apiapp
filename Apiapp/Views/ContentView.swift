@@ -13,6 +13,8 @@ struct ContentView: View {
         } detail: {
             if let tab = model.activeTab {
                 MainPane(tab: tab, isSidebarHidden: columnVisibility == .detailOnly)
+            } else if model.isLoading {
+                ProgressView().controlSize(.small)
             }
         }
         .sheet(item: $model.saveTarget) { target in

@@ -71,6 +71,14 @@ final class InMemorySecretStorage: SecretStorage {
     func save(_ data: Data) throws { self.data = data }
 }
 
+/// The Keychain item is there but isn't the vault's JSON. Treating it as empty would let
+/// the next write destroy whatever it holds, so the vault refuses to start instead.
+struct SecretVaultError: LocalizedError {
+    var errorDescription: String? {
+        "The secrets kept in the Keychain couldn’t be read. Removing the “Apiapp secrets” item in Keychain Access starts afresh."
+    }
+}
+
 /// Secrets, grouped by what owns them: a request, a history entry, a tab or a variable.
 final class SecretVault {
     private let storage: SecretStorage
@@ -79,7 +87,10 @@ final class SecretVault {
     init(storage: SecretStorage) throws {
         self.storage = storage
         if let data = try storage.load() {
-            secrets = (try? JSONDecoder().decode([String: [String: String]].self, from: data)) ?? [:]
+            guard let decoded = try? JSONDecoder().decode([String: [String: String]].self, from: data) else {
+                throw SecretVaultError()
+            }
+            secrets = decoded
         }
     }
 

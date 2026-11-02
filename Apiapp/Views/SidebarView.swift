@@ -6,6 +6,8 @@ struct SidebarView: View {
     @State private var search = ""
     @State private var expandedFolders: Set<UUID> = []
     @State private var requestToDelete: SavedRequest?
+    @State private var responseToDelete: SavedResponse?
+    @State private var isClearingHistory = false
     /// Refreshes the ages shown on history rows.
     @State private var now = Date()
 
@@ -45,6 +47,20 @@ struct SidebarView: View {
             Button("Delete", role: .destructive) { model.delete(savedRequest: request.id) }
         } message: { _ in
             Text("The file for this saved request is removed. History isn’t affected.")
+        }
+        .confirmationDialog(
+            "Delete “\(responseToDelete?.name ?? "")”?",
+            isPresented: Binding(get: { responseToDelete != nil }, set: { if !$0 { responseToDelete = nil } }),
+            presenting: responseToDelete
+        ) { response in
+            Button("Delete", role: .destructive) { model.delete(savedResponse: response.id) }
+        } message: { _ in
+            Text("The file for this saved response is removed.")
+        }
+        .confirmationDialog("Clear history?", isPresented: $isClearingHistory) {
+            Button("Clear History", role: .destructive) { model.clearHistory() }
+        } message: {
+            Text("Every entry and its file is removed. Saved requests and responses aren’t affected.")
         }
     }
 
@@ -166,7 +182,7 @@ struct SidebarView: View {
                     Button("Rename…") { model.renameTarget = .response(saved.id) }
                     Button("Export Body…") { model.exportBody(ofSavedResponse: saved.id) }
                     Divider()
-                    Button("Delete", role: .destructive) { model.delete(savedResponse: saved.id) }
+                    Button("Delete…", role: .destructive) { responseToDelete = saved }
                 }
             }
         }
@@ -191,7 +207,7 @@ struct SidebarView: View {
                 Text("History")
                 Spacer()
                 if !model.history.isEmpty {
-                    Button("Clear") { model.clearHistory() }
+                    Button("Clear…") { isClearingHistory = true }
                         .buttonStyle(.plain)
                         .font(Theme.caption)
                         .foregroundStyle(Theme.secondary)

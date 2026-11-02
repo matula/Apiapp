@@ -1,5 +1,6 @@
 import AppKit
 import Observation
+import Synchronization
 import SwiftUI
 
 enum SidebarItem: Hashable {
@@ -38,6 +39,8 @@ final class AppModel {
     var savedResponses: [SavedResponse] = []
     var environments: [RequestEnvironment] = []
     var activeEnvironmentID: UUID?
+    /// True until everything on disk has been read in.
+    private(set) var isLoading = true
 
     var alertMessage: String?
     var saveTarget: SaveTarget?
@@ -51,14 +54,17 @@ final class AppModel {
     private let store: Store
     private let vault: SecretVault
     private let runner: RequestRunner
+    private let workspaceWriter: WorkspaceWriter
     @ObservationIgnored private var sendTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored private var workspaceSave: Task<Void, Never>?
+    @ObservationIgnored private var workspaceVersion = 0
 
+    /// Nothing is read from disk until `load()` is called.
     init(store: Store, vault: SecretVault, runner: RequestRunner = RequestRunner()) {
         self.store = store
         self.vault = vault
         self.runner = runner
-        load()
+        workspaceWriter = WorkspaceWriter(store: store)
     }
 
     /// The app as the user runs it: Keychain secrets and data in Application Support.
@@ -70,11 +76,12 @@ final class AppModel {
             vault = try SecretVault(storage: storage)
         } catch {
             // Carrying on with the real Keychain could overwrite secrets we failed to read.
-            startupProblem = "\(error.localizedDescription) Tokens and passwords won’t be available or saved until the app is reopened."
+            startupProblem = "\(error.localizedDescription) Tokens and passwords won’t be available, and new ones won’t be kept, until that’s put right and the app is reopened."
             vault = try! SecretVault(storage: InMemorySecretStorage())
         }
         let model = AppModel(store: Store(root: Store.defaultRoot), vault: vault)
         if let startupProblem { model.alertMessage = startupProblem }
+        Task { await model.load() }
         return model
     }
 
@@ -113,8 +120,10 @@ final class AppModel {
 
     func update(_ tabID: UUID, _ change: (inout RequestTab) -> Void) {
         guard let index = index(of: tabID) else { return }
+        let before = tabs[index]
         change(&tabs[index])
-        scheduleWorkspaceSave()
+        // Pane choices and notices aren't kept in the workspace file, so they aren't worth a write.
+        if tabs[index].keptStateDiffers(from: before) { scheduleWorkspaceSave() }
     }
 
     // MARK: Tabs
@@ -189,9 +198,16 @@ final class AppModel {
         if let tab = tabs.first(where: { $0.savedResponseID == id }) {
             select(tab.id)
         } else if let saved = savedResponses.first(where: { $0.id == id }) {
-            var tab = RequestTab(draft: saved.request, savedResponseID: id)
-            tab.phase = .finished(ResponseDisplay(saved.response))
+            let tab = RequestTab(draft: saved.request, savedResponseID: id)
             open(tab)
+            // Getting a big body ready for the viewer takes a moment, so it's done away from
+            // the main thread, and only shown if nothing else has happened to the tab since.
+            let snapshot = saved.response
+            Task { [weak self] in
+                let display = await Task.detached(priority: .userInitiated) { ResponseDisplay(snapshot) }.value
+                guard let self, let index = self.index(of: tab.id), self.tabs[index].phase == .idle else { return }
+                self.tabs[index].phase = .finished(display)
+            }
         }
     }
 
@@ -215,9 +231,9 @@ final class AppModel {
         }
         let draft = tabs[index].draft
         let variables = activeEnvironment?.resolvedValues ?? [:]
-        let request: URLRequest
+        let plan: RequestBuilder.Plan
         do {
-            request = try RequestBuilder.build(draft, variables: variables)
+            plan = try RequestBuilder.plan(draft, variables: variables)
         } catch {
             tabs[index].phase = .failed(error.localizedDescription)
             return
@@ -234,6 +250,9 @@ final class AppModel {
         sendTasks[tabID] = Task { [weak self, runner] in
             let phase: RequestPhase
             do {
+                // Upload files are read here rather than on the main thread.
+                let request = try await Task.detached(priority: .userInitiated) { try RequestBuilder.assemble(plan) }.value
+                try Task.checkCancellation()
                 phase = .finished(try await runner.send(request, credentialHeaders: credentialHeaders))
             } catch is CancellationError {
                 phase = .cancelled
@@ -510,54 +529,58 @@ final class AppModel {
 
     // MARK: Loading and persistence
 
-    private func load() {
-        var readEverything = false
-        do {
-            let snapshot = try store.load()
-            folders = snapshot.folders
-            savedRequests = snapshot.requests.map { saved in
-                var saved = saved
-                saved.request.auth.apply(secrets: vault.values(for: saved.id))
-                return saved
-            }
-            history = snapshot.history
-                .map { entry in
-                    var entry = entry
-                    entry.request.auth.apply(secrets: vault.values(for: entry.id))
-                    return entry
-                }
-                .sorted { $0.sentAt > $1.sentAt }
-            savedResponses = snapshot.responses
-                .map { response in
-                    var response = response
-                    response.request.auth.apply(secrets: vault.values(for: response.id))
-                    return response
-                }
-                .sorted { $0.savedAt > $1.savedAt }
-            environments = snapshot.environments?.map(restoringSecrets) ?? [Self.starterEnvironment()]
-            activeEnvironmentID = snapshot.workspace.activeEnvironmentID ?? environments.first?.id
-            if !environments.contains(where: { $0.id == activeEnvironmentID }) {
-                activeEnvironmentID = environments.first?.id
-            }
-            tabs = snapshot.workspace.tabs.map(restoreTab)
-            activeTabID = snapshot.workspace.activeTabID
-            if !snapshot.unreadableFiles.isEmpty {
-                let files = snapshot.unreadableFiles.joined(separator: ", ")
-                alertMessage = "These files couldn’t be read and were skipped: \(files). Copies ending in .broken were kept beside them."
-            }
-            // The starter environment is written out only when the file is truly missing. One
-            // that exists but couldn't be read is left for the user to fix.
-            if snapshot.environments == nil, snapshot.isComplete { try store.save(environments: environments) }
-            readEverything = snapshot.isComplete
-        } catch {
-            alertMessage = error.localizedDescription
+    /// Reads everything from disk away from the main thread, then takes it in here.
+    /// Anything done in the meantime, such as opening a tab, is kept.
+    func load() async {
+        isLoading = true
+        let store = store
+        let result = await Task.detached(priority: .userInitiated) { Result { try store.load() } }.value
+        switch result {
+        case .success(let snapshot): take(snapshot)
+        case .failure(let error): report(error.localizedDescription)
         }
-
         if tabs.isEmpty { newTab() }
         if activeTab == nil { activeTabID = tabs.first?.id }
-        // After a failed or partial read, owners that are still on disk look as if they're
-        // gone, and pruning would throw their secrets away for good.
-        if readEverything { pruneSecrets() }
+        isLoading = false
+    }
+
+    private func take(_ snapshot: LibrarySnapshot) {
+        folders = snapshot.folders
+        savedRequests = snapshot.requests.map { saved in
+            var saved = saved
+            saved.request.auth.apply(secrets: vault.values(for: saved.id))
+            return saved
+        }
+        let earlier = snapshot.history.map { entry in
+            var entry = entry
+            entry.request.auth.apply(secrets: vault.values(for: entry.id))
+            return entry
+        }
+        history = (history + earlier).sorted { $0.sentAt > $1.sentAt }
+        savedResponses = snapshot.responses
+            .map { response in
+                var response = response
+                response.request.auth.apply(secrets: vault.values(for: response.id))
+                return response
+            }
+            .sorted { $0.savedAt > $1.savedAt }
+        environments = snapshot.environments?.map(restoringSecrets) ?? [Self.starterEnvironment()]
+        activeEnvironmentID = snapshot.workspace.activeEnvironmentID ?? environments.first?.id
+        if !environments.contains(where: { $0.id == activeEnvironmentID }) {
+            activeEnvironmentID = environments.first?.id
+        }
+        tabs = snapshot.workspace.tabs.map(restoreTab) + tabs
+        if activeTab == nil { activeTabID = snapshot.workspace.activeTabID }
+        if !snapshot.unreadableFiles.isEmpty {
+            let files = snapshot.unreadableFiles.joined(separator: ", ")
+            report("These files couldn’t be read and were skipped: \(files). Copies ending in .broken were kept beside them.")
+        }
+        // The starter environment is written out only when the file is truly missing. One
+        // that exists but couldn't be read is left for the user to fix.
+        if snapshot.environments == nil, snapshot.isComplete { attempt { try store.save(environments: environments) } }
+        // After a partial read, owners that are still on disk look as if they're gone, and
+        // pruning would throw their secrets away for good.
+        if snapshot.isComplete { pruneSecrets() }
     }
 
     private static func starterEnvironment() -> RequestEnvironment {
@@ -610,12 +633,20 @@ final class AppModel {
         workspaceSave = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(400))
             guard !Task.isCancelled else { return }
-            self?.saveWorkspace()
+            self?.saveWorkspace(inBackground: true)
         }
     }
 
-    func saveWorkspace() {
+    /// Keeps the tabs' secrets and writes the workspace file. The file holds every open
+    /// body twice, so it's normally written away from the main thread. `inBackground: false`
+    /// finishes the write before returning, for when the app is about to quit.
+    func saveWorkspace(inBackground: Bool = false) {
         workspaceSave?.cancel()
+        attempt {
+            for tab in tabs { try vault.set(tab.draft.auth.secrets, for: tab.id) }
+        }
+        workspaceVersion += 1
+        let version = workspaceVersion
         let state = WorkspaceState(
             tabs: tabs.map {
                 WorkspaceState.Tab(
@@ -629,9 +660,17 @@ final class AppModel {
             activeTabID: activeTabID,
             activeEnvironmentID: activeEnvironmentID
         )
-        attempt {
-            for tab in tabs { try vault.set(tab.draft.auth.secrets, for: tab.id) }
-            try store.save(workspace: state)
+        let writer = workspaceWriter
+        if inBackground {
+            Task.detached(priority: .utility) { [weak self] in
+                do {
+                    try writer.write(state, version: version)
+                } catch {
+                    await self?.report(error.localizedDescription)
+                }
+            }
+        } else {
+            attempt { try writer.write(state, version: version) }
         }
     }
 
@@ -640,6 +679,31 @@ final class AppModel {
             try work()
         } catch {
             alertMessage = error.localizedDescription
+        }
+    }
+
+    /// Shows a problem after any that's already waiting to be seen.
+    private func report(_ message: String) {
+        guard alertMessage?.contains(message) != true else { return }
+        alertMessage = [alertMessage, message].compactMap { $0 }.joined(separator: "\n\n")
+    }
+}
+
+/// Writes the workspace file from any thread. Each write carries a version, and one that
+/// was queued earlier never lands over a newer one.
+final class WorkspaceWriter: Sendable {
+    private let store: Store
+    private let lastWritten = Mutex(0)
+
+    init(store: Store) {
+        self.store = store
+    }
+
+    func write(_ state: WorkspaceState, version: Int) throws {
+        try lastWritten.withLock { last in
+            guard version > last else { return }
+            try store.save(workspace: state)
+            last = version
         }
     }
 }

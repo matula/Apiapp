@@ -1,4 +1,6 @@
+import AppKit
 import Foundation
+import SwiftUI
 import Testing
 @testable import Apiapp
 
@@ -481,6 +483,22 @@ import Testing
         request.auth.apiKeyPlacement = .query
         #expect(RequestBuilder.credentialHeaderNames(for: request, variables: [:]) == ["Authorization"])
     }
+
+    @Test func planningChecksUploadsAndAssemblingReadsThem() throws {
+        let file = FileManager.default.temporaryDirectory.appending(path: "\(UUID().uuidString).txt")
+        try Data("file text".utf8).write(to: file)
+        var request = draft()
+        request.setBodyType(.multipart)
+        request.multipartFields = [MultipartField(key: "upload", value: file.path, kind: .file)]
+        let plan = try RequestBuilder.plan(request, variables: [:], boundary: "BOUND")
+        let assembled = try RequestBuilder.assemble(plan)
+        #expect(assembled.httpBody.map { String(decoding: $0, as: UTF8.self) }?.contains("file text") == true)
+        #expect(assembled.value(forHTTPHeaderField: "Content-Type") == "multipart/form-data; boundary=BOUND")
+
+        try FileManager.default.removeItem(at: file)
+        #expect(throws: RequestBuildError.unreadableFile(file.path)) { try RequestBuilder.assemble(plan) }
+        #expect(throws: RequestBuildError.unreadableFile(file.path)) { try RequestBuilder.plan(request, variables: [:]) }
+    }
 }
 
 @Suite struct ResponseDisplayTests {
@@ -573,5 +591,92 @@ import Testing
         #expect(Formatting.age(since: now.addingTimeInterval(-120), now: now) == "2m")
         #expect(Formatting.age(since: now.addingTimeInterval(-7200), now: now) == "2h")
         #expect(Formatting.age(since: now.addingTimeInterval(-172800), now: now) == "2d")
+    }
+}
+
+@MainActor
+@Suite struct CodeEditorTests {
+    private final class TextBox {
+        var text = ""
+    }
+
+    @MainActor
+    private struct Editor {
+        var textView: NSTextView
+        var coordinator: CodeEditor.Coordinator
+        var ruler: LineNumberRuler
+
+        var length: Int { (textView.string as NSString).length }
+
+        func replace(_ range: NSRange, with text: String) {
+            textView.insertText(text, replacementRange: range)
+        }
+    }
+
+    /// The same TextKit stack `CodeEditor` builds, without a window.
+    private func makeEditor(_ text: String, language: CodeLanguage = .json) -> Editor {
+        let box = TextBox()
+        let coordinator = CodeEditor.Coordinator(text: Binding(get: { box.text }, set: { box.text = $0 }), language: language)
+        let storage = NSTextStorage()
+        let layoutManager = NSLayoutManager()
+        storage.addLayoutManager(layoutManager)
+        let container = NSTextContainer(size: NSSize(width: 400, height: CGFloat.greatestFiniteMagnitude))
+        layoutManager.addTextContainer(container)
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 300), textContainer: container)
+        textView.isRichText = false
+        textView.delegate = coordinator
+        let scrollView = NSScrollView(frame: textView.frame)
+        scrollView.documentView = textView
+        let ruler = LineNumberRuler(textView: textView, scrollView: scrollView)
+        coordinator.ruler = ruler
+        coordinator.replaceAll(in: textView, with: text)
+        return Editor(textView: textView, coordinator: coordinator, ruler: ruler)
+    }
+
+    private func colours(of editor: Editor) -> [ObjectIdentifier?] {
+        guard let layoutManager = editor.textView.layoutManager else { return [] }
+        return (0..<editor.length).map { index in
+            (layoutManager.temporaryAttribute(.foregroundColor, atCharacterIndex: index, effectiveRange: nil) as? NSColor).map(ObjectIdentifier.init)
+        }
+    }
+
+    private func lineStarts(of text: String) -> [Int] {
+        var starts = [0]
+        for (index, unit) in text.utf16.enumerated() where unit == 0x0A { starts.append(index + 1) }
+        return starts
+    }
+
+    @Test func editsRecolourOnlyNearbyLinesAndMatchAFullPass() {
+        let editor = makeEditor("{\n  \"a\": 1,\n  \"b\": [true, null],\n  \"c\": \"{{name}}\"\n}")
+        editor.replace(NSRange(location: 4, length: 0), with: "\"z\": -2.5e3, ")
+        #expect(editor.coordinator.lastPassWasPartial)
+        editor.replace(NSRange(location: 2, length: 1), with: "")
+        editor.replace(NSRange(location: 1, length: 0), with: "\n  \"q\"\n  : false,")
+        editor.replace(NSRange(location: editor.length, length: 0), with: "\n")
+        let incremental = colours(of: editor)
+        editor.coordinator.highlight(editor.textView)
+        #expect(!editor.coordinator.lastPassWasPartial)
+        #expect(colours(of: editor) == incremental)
+        #expect(incremental.contains { $0 != nil })
+        #expect(editor.coordinator.lastText == editor.textView.string)
+    }
+
+    @Test func lineNumbersKeepUpWithEdits() {
+        let editor = makeEditor("one\ntwo\nthree")
+        func check() {
+            #expect(editor.ruler.lineStarts == lineStarts(of: editor.textView.string))
+        }
+        editor.replace(NSRange(location: 4, length: 0), with: "x\ny\n")
+        check()
+        editor.replace(NSRange(location: 2, length: 5), with: "")
+        check()
+        editor.replace(NSRange(location: editor.length, length: 0), with: "\n")
+        check()
+        editor.replace(NSRange(location: 0, length: 0), with: "ab\n")
+        check()
+        editor.replace(NSRange(location: 3, length: 2), with: "\n\n\n")
+        check()
+        editor.replace(NSRange(location: 0, length: editor.length), with: "")
+        #expect(editor.ruler.lineStarts == [0])
     }
 }

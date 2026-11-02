@@ -11,6 +11,9 @@ final class LocalEchoServer: @unchecked Sendable {
     /// a 302 to this URL instead of an echo.
     var redirectLocation: String?
 
+    /// Leaves out Content-Length, so the body's size is only known once the connection closes.
+    var omitsContentLength = false
+
     init() throws {
         let parameters = NWParameters.tcp
         parameters.requiredInterfaceType = .loopback
@@ -74,7 +77,8 @@ final class LocalEchoServer: @unchecked Sendable {
             response = Data("HTTP/1.1 302 Found\r\nLocation: \(location)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8)
         } else {
             let body = (try? JSONEncoder().encode(text)) ?? Data()
-            response = Data("HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nX-Echo: yes\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8)
+            let length = omitsContentLength ? "" : "Content-Length: \(body.count)\r\n"
+            response = Data("HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nX-Echo: yes\r\n\(length)Connection: close\r\n\r\n".utf8)
             response.append(body)
         }
         connection.send(content: response, completion: .contentProcessed { _ in connection.cancel() })

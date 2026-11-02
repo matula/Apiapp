@@ -49,6 +49,12 @@ struct RequestTab: Identifiable {
     var isDirty: Bool { draft != baseline }
     var isSending: Bool { phase == .sending }
 
+    /// True when something the workspace file keeps differs from `other`.
+    func keptStateDiffers(from other: RequestTab) -> Bool {
+        draft != other.draft || baseline != other.baseline
+            || savedRequestID != other.savedRequestID || historyEntryID != other.historyEntryID
+    }
+
     var response: ResponseDisplay? {
         if case .finished(let display) = phase { return display }
         return nil

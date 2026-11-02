@@ -1,8 +1,8 @@
 import Foundation
 
 /// The tabs that were open, so they come back on the next launch.
-struct WorkspaceState: Codable, Equatable {
-    struct Tab: Codable, Equatable {
+struct WorkspaceState: Codable, Equatable, Sendable {
+    struct Tab: Codable, Equatable, Sendable {
         var id: UUID
         var draft: RequestDraft
         var baseline: RequestDraft
@@ -16,7 +16,7 @@ struct WorkspaceState: Codable, Equatable {
 }
 
 /// Everything read from disk at launch.
-struct LibrarySnapshot {
+struct LibrarySnapshot: Sendable {
     var folders: [Folder] = []
     var requests: [SavedRequest] = []
     var history: [HistoryEntry] = []
