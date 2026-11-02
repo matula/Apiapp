@@ -18,6 +18,18 @@ Run the tests with:
 xcodebuild test -project Apiapp.xcodeproj -scheme Apiapp -destination 'platform=macOS'
 ```
 
+### Builds from GitHub
+
+Every push to `main` runs [the Build workflow](.github/workflows/build.yml) on GitHub's macOS runners: the test suite in one job and a universal Release build in another. Start one by hand from the Actions tab (Build → Run workflow) on any branch. The build is attached to the run as the `Apiapp-macOS` artifact, a zip holding `Apiapp.app`.
+
+The app is signed ad hoc and not notarized, so Gatekeeper blocks the first launch of a downloaded copy. Allow it under System Settings → Privacy & Security → Open Anyway, or clear the quarantine flag first:
+
+```bash
+xattr -dr com.apple.quarantine ~/Downloads/Apiapp.app
+```
+
+A new build may also ask once for access to the “Apiapp secrets” Keychain item, since macOS treats a changed binary as a new app. Always Allow keeps it quiet until the next build.
+
 ## Shortcuts
 
 | Action | Keys |

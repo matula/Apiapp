@@ -1,0 +1,86 @@
+# Builds Apiapp on every push to main, and on demand from the Actions tab
+# (Build → Run workflow, on any branch). The Release build is uploaded as the
+# "Apiapp-macOS" artifact: a zip holding Apiapp.app.
+name: Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push cancels a run still going for the same branch.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The Xcode the project is developed with. The macos-26 image carries every
+  # Xcode 26 release; drop this line to take whatever the image's default is.
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+
+jobs:
+  test:
+    name: Tests
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run the test suite
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project Apiapp.xcodeproj \
+            -scheme Apiapp \
+            -destination 'platform=macOS' \
+            -derivedDataPath build/DerivedData \
+            -resultBundlePath build/Tests.xcresult \
+            | xcbeautify --renderer github-actions
+
+      - name: Keep the test results
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results
+          path: build/Tests.xcresult
+          if-no-files-found: ignore
+
+  build:
+    name: Release build
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build Apiapp.app (Release, universal)
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project Apiapp.xcodeproj \
+            -scheme Apiapp \
+            -configuration Release \
+            -destination 'platform=macOS' \
+            -derivedDataPath build/DerivedData \
+            ONLY_ACTIVE_ARCH=NO \
+            | xcbeautify --renderer github-actions
+
+      - name: Check the app
+        run: |
+          app=build/DerivedData/Build/Products/Release/Apiapp.app
+          lipo -info "$app/Contents/MacOS/Apiapp"
+          codesign --verify --verbose=2 "$app"
+
+      # ditto keeps the bundle's symlinks and permissions; upload-artifact's
+      # own zip would not, and the app would not launch after download.
+      - name: Zip the app
+        run: ditto -c -k --keepParent build/DerivedData/Build/Products/Release/Apiapp.app build/Apiapp.zip
+
+      - name: Upload Apiapp.zip
+        uses: actions/upload-artifact@v7
+        with:
+          name: Apiapp-macOS
+          path: build/Apiapp.zip
+          if-no-files-found: error
