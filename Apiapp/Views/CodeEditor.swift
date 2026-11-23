@@ -13,8 +13,10 @@ struct CodeEditor: NSViewRepresentable {
     var language: CodeLanguage
     var isEditable = true
 
+    private var allowsFolding: Bool { !isEditable && language == .json }
+
     func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text, language: language)
+        Coordinator(text: $text, language: language, allowsFolding: allowsFolding)
     }
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -25,7 +27,7 @@ struct CodeEditor: NSViewRepresentable {
         container.widthTracksTextView = true
         layoutManager.addTextContainer(container)
 
-        let textView = NSTextView(frame: .zero, textContainer: container)
+        let textView = CodeTextView(frame: .zero, textContainer: container)
         textView.isEditable = isEditable
         textView.isSelectable = true
         textView.isRichText = false
@@ -77,15 +79,17 @@ struct CodeEditor: NSViewRepresentable {
         let coordinator = context.coordinator
         coordinator.text = $text
         textView.isEditable = isEditable
+        let foldingChanged = coordinator.allowsFolding != allowsFolding
+        coordinator.allowsFolding = allowsFolding
 
         if coordinator.language != language {
             coordinator.language = language
             coordinator.highlight(textView)
         }
-        guard text != coordinator.lastText else { return }
+        guard text != coordinator.lastText || foldingChanged else { return }
 
         // Going through shouldChangeText keeps Format JSON undoable with ⌘Z.
-        if isEditable {
+        if isEditable, !foldingChanged {
             let everything = NSRange(location: 0, length: (textView.string as NSString).length)
             guard textView.shouldChangeText(in: everything, replacementString: text) else { return }
             textView.textStorage?.replaceCharacters(in: everything, with: NSAttributedString(string: text, attributes: Coordinator.baseAttributes))
@@ -112,7 +116,10 @@ struct CodeEditor: NSViewRepresentable {
 
         var text: Binding<String>
         var language: CodeLanguage
+        var allowsFolding: Bool
+        /// The full text, which differs from what the view shows while blocks are collapsed.
         var lastText = ""
+        private(set) var folds: FoldedText?
         weak var ruler: LineNumberRuler?
         /// The text that the next change replaces, noted before it happens, so that only
         /// that part of the document needs colouring again afterwards.
@@ -121,24 +128,57 @@ struct CodeEditor: NSViewRepresentable {
         /// Whether the last colouring pass covered only the lines around an edit.
         private(set) var lastPassWasPartial = false
 
-        init(text: Binding<String>, language: CodeLanguage) {
+        init(text: Binding<String>, language: CodeLanguage, allowsFolding: Bool = false) {
             self.text = text
             self.language = language
+            self.allowsFolding = allowsFolding
         }
 
         func replaceAll(in textView: NSTextView, with newText: String) {
+            let folds = allowsFolding ? FoldedText(newText) : nil
+            self.folds = folds?.regions.isEmpty == false ? folds : nil
             textView.textStorage?.setAttributedString(NSAttributedString(string: newText, attributes: Self.baseAttributes))
             lastText = newText
             textView.typingAttributes = Self.baseAttributes
             highlight(textView)
+            ruler?.showsFoldColumn = self.folds != nil
             ruler?.textDidChange()
+        }
+
+        func toggleFold(onLine index: Int, in textView: NSTextView) {
+            guard let lines = folds?.lines, index < lines.count, let region = lines[index].region else { return }
+            toggle(region, in: textView)
+        }
+
+        /// Returns false when the character isn't part of a collapsed block's placeholder.
+        func expandFold(at characterIndex: Int, in textView: NSTextView) -> Bool {
+            guard let elision = folds?.elision(at: characterIndex) else { return false }
+            toggle(elision.region, in: textView)
+            return true
+        }
+
+        /// The full text behind the selection, or nil when nothing is collapsed.
+        func unfoldedText(for ranges: [NSRange]) -> String? {
+            guard let folds, !folds.elisions.isEmpty else { return nil }
+            return ranges.map { folds.fullText(for: $0) }.joined(separator: "\n")
+        }
+
+        private func toggle(_ region: FoldedText.Region, in textView: NSTextView) {
+            guard let edit = folds?.toggle(region), let storage = textView.textStorage else { return }
+            storage.replaceCharacters(in: edit.range, with: NSAttributedString(string: edit.replacement, attributes: Self.baseAttributes))
+            let length = (edit.replacement as NSString).length
+            highlight(textView, around: NSRange(location: edit.range.location, length: length))
+            ruler?.textDidChange(replacing: edit.range, withLength: length)
         }
 
         /// Colours the whole document.
         func highlight(_ textView: NSTextView) {
             guard let layoutManager = textView.layoutManager else { return }
+            defer { markPlaceholders(in: layoutManager) }
             let length = (textView.string as NSString).length
-            layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: NSRange(location: 0, length: length))
+            let everything = NSRange(location: 0, length: length)
+            layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: everything)
+            layoutManager.removeTemporaryAttribute(.backgroundColor, forCharacterRange: everything)
             lastPassWasPartial = false
             isWholeDocumentColoured = length <= CodeEditor.highlightLimit
             guard isWholeDocumentColoured else { return }
@@ -161,8 +201,19 @@ struct CodeEditor: NSViewRepresentable {
             let end = min(NSMaxRange(edited) + 1, string.length)
             let range = string.paragraphRange(for: NSRange(location: start, length: end - start))
             layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: range)
+            layoutManager.removeTemporaryAttribute(.backgroundColor, forCharacterRange: range)
             apply(SyntaxHighlighter.tokens(in: string.substring(with: range), language: language), offset: range.location, to: layoutManager)
+            markPlaceholders(in: layoutManager)
             lastPassWasPartial = true
+        }
+
+        private func markPlaceholders(in layoutManager: NSLayoutManager) {
+            for elision in folds?.elisions ?? [] {
+                layoutManager.addTemporaryAttributes(
+                    [.foregroundColor: Palette.secondary, .backgroundColor: Palette.track],
+                    forCharacterRange: elision.placeholder
+                )
+            }
         }
 
         private func apply(_ tokens: [SyntaxToken], offset: Int, to layoutManager: NSLayoutManager) {
@@ -263,6 +314,38 @@ enum FindCommand {
     }
 }
 
+/// Copies the full JSON behind collapsed blocks, and expands a block when its
+/// placeholder is clicked.
+final class CodeTextView: NSTextView {
+    private var coordinator: CodeEditor.Coordinator? { delegate as? CodeEditor.Coordinator }
+
+    override func writeSelection(to pboard: NSPasteboard, types: [NSPasteboard.PasteboardType]) -> Bool {
+        guard let text = coordinator?.unfoldedText(for: selectedRanges.map(\.rangeValue)) else {
+            return super.writeSelection(to: pboard, types: types)
+        }
+        pboard.declareTypes([.string], owner: nil)
+        return pboard.setString(text, forType: .string)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if event.clickCount == 1,
+           let index = characterIndex(under: convert(event.locationInWindow, from: nil)),
+           coordinator?.expandFold(at: index, in: self) == true {
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
+    private func characterIndex(under point: NSPoint) -> Int? {
+        guard let layoutManager, let textContainer, layoutManager.numberOfGlyphs > 0 else { return nil }
+        let inContainer = NSPoint(x: point.x - textContainerOrigin.x, y: point.y - textContainerOrigin.y)
+        let glyph = layoutManager.glyphIndex(for: inContainer, in: textContainer)
+        let bounds = layoutManager.boundingRect(forGlyphRange: NSRange(location: glyph, length: 1), in: textContainer)
+        guard bounds.contains(inContainer) else { return nil }
+        return layoutManager.characterIndexForGlyph(at: glyph)
+    }
+}
+
 /// Keeps the text view at least as tall as the pane, so clicking anywhere in an
 /// empty or short body puts the cursor in it.
 final class EditorScrollView: NSScrollView {
@@ -276,9 +359,11 @@ final class EditorScrollView: NSScrollView {
     }
 }
 
-/// The line-number column. Long lines wrap, so only a line's first row gets a number.
+/// The line-number column, plus fold arrows for collapsible JSON. Long lines wrap, so
+/// only a line's first row gets a number.
 final class LineNumberRuler: NSRulerView {
-    private static let width: CGFloat = 36
+    private static let numberWidth: CGFloat = 36
+    private static let foldWidth: CGFloat = 14
     private static let attributes: [NSAttributedString.Key: Any] = [
         .font: NSFont.monospacedSystemFont(ofSize: 12.5, weight: .regular),
         .foregroundColor: Palette.lineNumber,
@@ -288,16 +373,49 @@ final class LineNumberRuler: NSRulerView {
     /// Where each line begins, as a UTF-16 offset. A start is the index just after a newline.
     private(set) var lineStarts: [Int] = [0]
 
+    var showsFoldColumn = false {
+        didSet {
+            guard showsFoldColumn != oldValue else { return }
+            ruleThickness = Self.numberWidth + (showsFoldColumn ? Self.foldWidth : 0)
+        }
+    }
+
+    private var coordinator: CodeEditor.Coordinator? { textView?.delegate as? CodeEditor.Coordinator }
+
     init(textView: NSTextView, scrollView: NSScrollView) {
         self.textView = textView
         super.init(scrollView: scrollView, orientation: .verticalRuler)
         clientView = textView
-        ruleThickness = Self.width
+        ruleThickness = Self.numberWidth
     }
 
     @available(*, unavailable)
     required init(coder: NSCoder) {
         fatalError("init(coder:) is not used")
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let textView, let line = foldLine(at: convert(event.locationInWindow, from: nil)) else {
+            super.mouseDown(with: event)
+            return
+        }
+        coordinator?.toggleFold(onLine: line, in: textView)
+    }
+
+    /// The line whose fold arrow sits at this point of the ruler.
+    func foldLine(at point: NSPoint) -> Int? {
+        guard showsFoldColumn, point.x >= Self.numberWidth, let textView,
+              let layoutManager = textView.layoutManager, let container = textView.textContainer,
+              let lines = coordinator?.folds?.lines, layoutManager.numberOfGlyphs > 0 else { return nil }
+        let inContainer = NSPoint(x: 0, y: textView.convert(point, from: self).y - textView.textContainerOrigin.y)
+        var glyphs = NSRange()
+        let glyph = layoutManager.glyphIndex(for: inContainer, in: container)
+        let fragment = layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: &glyphs)
+        guard inContainer.y >= fragment.minY, inContainer.y < fragment.maxY else { return nil }
+        let character = layoutManager.characterIndexForGlyph(at: glyphs.location)
+        let line = lineNumber(at: character)
+        guard lineStarts[line] == character, line < lines.count, lines[line].region != nil else { return nil }
+        return line
     }
 
     /// Recomputes every line start.
@@ -359,20 +477,55 @@ final class LineNumberRuler: NSRulerView {
         visible.origin.y -= inset
         let glyphs = layoutManager.glyphRange(forBoundingRect: visible, in: container)
         var lineIndex = lineNumber(at: layoutManager.characterIndexForGlyph(at: glyphs.location))
+        let foldLines = coordinator?.folds?.lines
 
         layoutManager.enumerateLineFragments(forGlyphRange: glyphs) { fragment, _, _, glyphRange, _ in
             let character = layoutManager.characterIndexForGlyph(at: glyphRange.location)
             while lineIndex + 1 < self.lineStarts.count, self.lineStarts[lineIndex + 1] <= character { lineIndex += 1 }
             if self.lineStarts[lineIndex] == character {
-                self.drawNumber(lineIndex + 1, y: originY + fragment.minY)
+                self.drawLine(lineIndex, foldLines: foldLines, y: originY + fragment.minY)
             }
         }
 
         // A trailing newline leaves an empty last line with no glyphs of its own.
         let extra = layoutManager.extraLineFragmentRect
         if !extra.isEmpty, string.hasSuffix("\n") {
-            drawNumber(lineStarts.count, y: originY + extra.minY)
+            drawLine(lineStarts.count - 1, foldLines: foldLines, y: originY + extra.minY)
         }
+    }
+
+    /// With blocks collapsed, the shown lines keep their numbers from the full text.
+    private func drawLine(_ index: Int, foldLines: [FoldedText.Line]?, y: CGFloat) {
+        guard let foldLines, index < foldLines.count else {
+            drawNumber(index + 1, y: y)
+            return
+        }
+        let line = foldLines[index]
+        drawNumber(line.number, y: y)
+        if line.region != nil {
+            drawFoldArrow(collapsed: line.isCollapsed, y: y)
+        }
+    }
+
+    private func drawFoldArrow(collapsed: Bool, y: CGFloat) {
+        let x = Self.numberWidth + Self.foldWidth / 2
+        let middle = y + CodeEditor.lineHeight / 2
+        let arm: CGFloat = 3.5
+        let path = NSBezierPath()
+        if collapsed {
+            path.move(to: NSPoint(x: x - arm / 2, y: middle - arm))
+            path.line(to: NSPoint(x: x + arm / 2, y: middle))
+            path.line(to: NSPoint(x: x - arm / 2, y: middle + arm))
+        } else {
+            path.move(to: NSPoint(x: x - arm, y: middle - arm / 2))
+            path.line(to: NSPoint(x: x, y: middle + arm / 2))
+            path.line(to: NSPoint(x: x + arm, y: middle - arm / 2))
+        }
+        path.lineWidth = 1.5
+        path.lineCapStyle = .round
+        path.lineJoinStyle = .round
+        Palette.lineNumber.setStroke()
+        path.stroke()
     }
 
     private func lineNumber(at character: Int) -> Int {
@@ -388,7 +541,7 @@ final class LineNumberRuler: NSRulerView {
     private func drawNumber(_ number: Int, y: CGFloat) {
         let label = String(number) as NSString
         let size = label.size(withAttributes: Self.attributes)
-        let origin = NSPoint(x: Self.width - size.width - 4, y: y + (CodeEditor.lineHeight - size.height) / 2)
+        let origin = NSPoint(x: Self.numberWidth - size.width - 4, y: y + (CodeEditor.lineHeight - size.height) / 2)
         label.draw(at: origin, withAttributes: Self.attributes)
     }
 }

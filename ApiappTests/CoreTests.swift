@@ -614,15 +614,19 @@ import Testing
     }
 
     /// The same TextKit stack `CodeEditor` builds, without a window.
-    private func makeEditor(_ text: String, language: CodeLanguage = .json) -> Editor {
+    private func makeEditor(_ text: String, language: CodeLanguage = .json, allowsFolding: Bool = false) -> Editor {
         let box = TextBox()
-        let coordinator = CodeEditor.Coordinator(text: Binding(get: { box.text }, set: { box.text = $0 }), language: language)
+        let coordinator = CodeEditor.Coordinator(
+            text: Binding(get: { box.text }, set: { box.text = $0 }),
+            language: language,
+            allowsFolding: allowsFolding
+        )
         let storage = NSTextStorage()
         let layoutManager = NSLayoutManager()
         storage.addLayoutManager(layoutManager)
         let container = NSTextContainer(size: NSSize(width: 400, height: CGFloat.greatestFiniteMagnitude))
         layoutManager.addTextContainer(container)
-        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 300), textContainer: container)
+        let textView = CodeTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 300), textContainer: container)
         textView.isRichText = false
         textView.delegate = coordinator
         let scrollView = NSScrollView(frame: textView.frame)
@@ -678,5 +682,119 @@ import Testing
         check()
         editor.replace(NSRange(location: 0, length: editor.length), with: "")
         #expect(editor.ruler.lineStarts == [0])
+    }
+
+    @Test func foldingCollapsesExpandsAndCopiesTheFullJSON() throws {
+        let editor = makeEditor(FoldedTextTests.json, allowsFolding: true)
+        #expect(editor.ruler.showsFoldColumn)
+
+        editor.coordinator.toggleFold(onLine: 2, in: editor.textView)
+        let folds = try #require(editor.coordinator.folds)
+        #expect(editor.textView.string == folds.shown)
+        #expect(editor.textView.string.contains("\"items\": [ … ],"))
+        #expect(editor.ruler.lineStarts == lineStarts(of: editor.textView.string))
+        #expect(folds.lines.count == editor.ruler.lineStarts.count)
+        #expect(editor.coordinator.lastText == FoldedTextTests.json)
+
+        let incremental = colours(of: editor)
+        editor.coordinator.highlight(editor.textView)
+        #expect(colours(of: editor) == incremental)
+
+        editor.textView.selectAll(nil)
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        #expect(editor.textView.writeSelection(to: board, types: [.string]))
+        #expect(board.string(forType: .string) == FoldedTextTests.json)
+
+        let placeholder = try #require(folds.elisions.first).placeholder
+        #expect(!editor.coordinator.expandFold(at: 0, in: editor.textView))
+        #expect(editor.coordinator.expandFold(at: placeholder.location + 1, in: editor.textView))
+        #expect(editor.textView.string == FoldedTextTests.json)
+        #expect(editor.ruler.lineStarts == lineStarts(of: FoldedTextTests.json))
+    }
+
+    @Test func foldingIsOffWithoutMultiLineJSONBlocks() {
+        #expect(makeEditor(FoldedTextTests.json).coordinator.folds == nil)
+        #expect(makeEditor("[1, 2]", allowsFolding: true).coordinator.folds == nil)
+        #expect(!makeEditor("[1, 2]", allowsFolding: true).ruler.showsFoldColumn)
+    }
+}
+
+@Suite struct FoldedTextTests {
+    static let json = """
+    {
+      "a": 1,
+      "items": [
+        {
+          "id": "x{["
+        },
+        2
+      ],
+      "tag": {{name}},
+      "empty": {},
+      "b": true
+    }
+    """
+
+    @Test func onlyMultiLineBlocksFold() {
+        let folds = FoldedText(Self.json)
+        #expect(folds.shown == Self.json)
+        #expect(folds.lines.map(\.number) == Array(1...12))
+        #expect(folds.lines.filter { $0.region != nil }.map(\.number) == [1, 3, 4])
+    }
+
+    @Test func collapsedLinesKeepTheirNumbers() throws {
+        var folds = FoldedText(Self.json)
+        let items = try #require(folds.lines[2].region)
+        _ = folds.toggle(items)
+        #expect(folds.shown == """
+        {
+          "a": 1,
+          "items": [ … ],
+          "tag": {{name}},
+          "empty": {},
+          "b": true
+        }
+        """)
+        #expect(folds.lines.map(\.number) == [1, 2, 3, 9, 10, 11, 12])
+        #expect(folds.lines[2].isCollapsed)
+    }
+
+    @Test func innerBlocksStayCollapsedWhenTheOuterOneReopens() throws {
+        var folds = FoldedText(Self.json)
+        let items = try #require(folds.lines[2].region)
+        let inner = try #require(folds.lines[3].region)
+        _ = folds.toggle(inner)
+        _ = folds.toggle(items)
+        #expect(folds.toggle(inner) == nil)
+        _ = folds.toggle(items)
+        #expect(folds.shown.contains("    { … },\n    2\n"))
+        #expect(folds.lines.map(\.number) == [1, 2, 3, 4, 7, 8, 9, 10, 11, 12])
+        #expect(folds.isCollapsed(inner))
+    }
+
+    @Test func editsTurnTheOldShownTextIntoTheNew() throws {
+        var folds = FoldedText(Self.json)
+        let regions = folds.regions
+        let shown = NSMutableString(string: folds.shown)
+        for region in [regions[2], regions[1], regions[0], regions[0], regions[2], regions[1]] {
+            guard let edit = folds.toggle(region) else { continue }
+            shown.replaceCharacters(in: edit.range, with: edit.replacement)
+            #expect(shown as String == folds.shown)
+        }
+    }
+
+    @Test func copyingAPlaceholderBringsWhatItHides() throws {
+        var folds = FoldedText(Self.json)
+        _ = folds.toggle(try #require(folds.lines[2].region))
+        let shown = folds.shown as NSString
+        let line = shown.lineRange(for: NSRange(location: shown.range(of: "items").location, length: 0))
+        let placeholder = try #require(folds.elisions.first).placeholder
+
+        #expect(folds.fullText(for: NSRange(location: 0, length: shown.length)) == Self.json)
+        #expect(folds.fullText(for: NSRange(location: line.location, length: placeholder.location - line.location)) == "  \"items\": [")
+        #expect(folds.fullText(for: NSRange(location: placeholder.location + 1, length: 0)) == (Self.json as NSString).substring(with: try #require(folds.elisions.first).region.hidden))
+        #expect(folds.fullText(for: line).hasPrefix("  \"items\": [\n    {\n"))
+        #expect(folds.fullText(for: line).hasSuffix("    2\n  ],\n"))
     }
 }
