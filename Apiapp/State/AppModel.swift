@@ -58,6 +58,8 @@ final class AppModel {
     @ObservationIgnored private var sendTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored private var workspaceSave: Task<Void, Never>?
     @ObservationIgnored private var workspaceVersion = 0
+    @ObservationIgnored private var libraryObserver: NSObjectProtocol?
+    @ObservationIgnored private var libraryReload: Task<Void, Never>?
 
     /// Nothing is read from disk until `load()` is called.
     init(store: Store, vault: SecretVault, runner: RequestRunner = RequestRunner()) {
@@ -82,6 +84,7 @@ final class AppModel {
         let model = AppModel(store: Store(root: Store.defaultRoot), vault: vault)
         if let startupProblem { model.alertMessage = startupProblem }
         Task { await model.load() }
+        model.watchForLibraryChanges()
         return model
     }
 
@@ -546,11 +549,7 @@ final class AppModel {
 
     private func take(_ snapshot: LibrarySnapshot) {
         folders = snapshot.folders
-        savedRequests = snapshot.requests.map { saved in
-            var saved = saved
-            saved.request.auth.apply(secrets: vault.values(for: saved.id))
-            return saved
-        }
+        savedRequests = snapshot.requests.map(restoringSecrets)
         let earlier = snapshot.history.map { entry in
             var entry = entry
             entry.request.auth.apply(secrets: vault.values(for: entry.id))
@@ -571,10 +570,7 @@ final class AppModel {
         }
         tabs = snapshot.workspace.tabs.map(restoreTab) + tabs
         if activeTab == nil { activeTabID = snapshot.workspace.activeTabID }
-        if !snapshot.unreadableFiles.isEmpty {
-            let files = snapshot.unreadableFiles.joined(separator: ", ")
-            report("These files couldn’t be read and were skipped: \(files). Copies ending in .broken were kept beside them.")
-        }
+        reportUnreadable(snapshot.unreadableFiles)
         // The starter environment is written out only when the file is truly missing. One
         // that exists but couldn't be read is left for the user to fix.
         if snapshot.environments == nil, snapshot.isComplete { attempt { try store.save(environments: environments) } }
@@ -585,6 +581,68 @@ final class AppModel {
 
     private static func starterEnvironment() -> RequestEnvironment {
         RequestEnvironment(name: "Local", variables: [Variable(key: "baseUrl", value: "http://localhost:3000")])
+    }
+
+    private func reportUnreadable(_ files: [String]) {
+        guard !files.isEmpty else { return }
+        report("These files couldn’t be read and were skipped: \(files.joined(separator: ", ")). Copies ending in .broken were kept beside them.")
+    }
+
+    /// Listens for `Apiapp --mcp` changing saved requests, folders or environments.
+    func watchForLibraryChanges() {
+        libraryObserver = LibraryChangeNotice.observe(root: store.root) { [weak self] in
+            Task { @MainActor in self?.scheduleLibraryReload() }
+        }
+    }
+
+    /// A burst of tool calls ends in one reload.
+    private func scheduleLibraryReload() {
+        libraryReload?.cancel()
+        libraryReload = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(150))
+            guard !Task.isCancelled else { return }
+            await self?.reloadLibrary()
+        }
+    }
+
+    /// Takes in saved requests, folders and environments that changed on disk. A tab showing
+    /// a saved request picks up the new version, unless it has edits of its own, which it keeps.
+    func reloadLibrary() async {
+        guard !isLoading else { return }
+        let store = store
+        let result = await Task.detached(priority: .userInitiated) { Result { try store.loadLibrary() } }.value
+        let library: LibraryFiles
+        switch result {
+        case .success(let loaded): library = loaded
+        case .failure(let error): return report(error.localizedDescription)
+        }
+        // A partial read looks like deletions, so nothing is taken in until it all reads cleanly.
+        guard library.isComplete else { return reportUnreadable(library.unreadableFiles) }
+
+        folders = library.folders
+        savedRequests = library.requests.map(restoringSecrets)
+        if let updated = library.environments {
+            environments = updated.map(restoringSecrets)
+            if !environments.contains(where: { $0.id == activeEnvironmentID }) {
+                activeEnvironmentID = environments.first?.id
+            }
+        }
+        for index in tabs.indices {
+            guard let id = tabs[index].savedRequestID else { continue }
+            guard let saved = savedRequests.first(where: { $0.id == id }) else {
+                tabs[index].savedRequestID = nil
+                continue
+            }
+            if !tabs[index].isDirty { tabs[index].draft = saved.request }
+            tabs[index].baseline = saved.request
+        }
+        scheduleWorkspaceSave()
+    }
+
+    private func restoringSecrets(in saved: SavedRequest) -> SavedRequest {
+        var saved = saved
+        saved.request.auth.apply(secrets: vault.values(for: saved.id))
+        return saved
     }
 
     private func restoringSecrets(in environment: RequestEnvironment) -> RequestEnvironment {

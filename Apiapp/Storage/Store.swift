@@ -31,6 +31,17 @@ struct LibrarySnapshot: Sendable {
     var isComplete: Bool { unreadableFiles.isEmpty }
 }
 
+/// Saved requests, folders and environments: the files `Apiapp --mcp` writes too.
+struct LibraryFiles: Sendable {
+    var folders: [Folder] = []
+    var requests: [SavedRequest] = []
+    /// Nil when there is no environments file, and also when there is one that couldn't be read.
+    var environments: [RequestEnvironment]?
+    var unreadableFiles: [String] = []
+
+    var isComplete: Bool { unreadableFiles.isEmpty }
+}
+
 /// Plain JSON files, one per saved request, history entry and saved response:
 ///
 ///     requests/<id>.json   history/<id>.json   responses/<id>.json
@@ -93,6 +104,17 @@ struct Store {
         snapshot.workspace = read(workspaceFile, unreadable: &unreadable) ?? WorkspaceState()
         snapshot.unreadableFiles = unreadable
         return snapshot
+    }
+
+    func loadLibrary() throws -> LibraryFiles {
+        try prepare()
+        var library = LibraryFiles()
+        var unreadable: [String] = []
+        library.requests = readAll(in: requestsDirectory, unreadable: &unreadable)
+        library.folders = read(foldersFile, unreadable: &unreadable) ?? []
+        library.environments = read(environmentsFile, unreadable: &unreadable)
+        library.unreadableFiles = unreadable
+        return library
     }
 
     func save(_ request: SavedRequest) throws { try write(request, to: file(request.id, in: requestsDirectory)) }

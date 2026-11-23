@@ -154,10 +154,12 @@ struct AuthConfig: Equatable, Sendable {
         return candidates.filter { !$0.value.isEmpty && !Self.isVariableReference($0.value) }
     }
 
+    /// Fills only fields the file left empty. A `{{variable}}` in the file wins, since
+    /// `Apiapp --mcp` can change the file without updating the vault.
     mutating func apply(secrets: [String: String]) {
-        if let value = secrets["token"] { token = value }
-        if let value = secrets["password"] { password = value }
-        if let value = secrets["apiKeyValue"] { apiKeyValue = value }
+        if token.isEmpty, let value = secrets["token"] { token = value }
+        if password.isEmpty, let value = secrets["password"] { password = value }
+        if apiKeyValue.isEmpty, let value = secrets["apiKeyValue"] { apiKeyValue = value }
     }
 }
 

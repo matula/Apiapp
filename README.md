@@ -62,6 +62,27 @@ Auth tab tokens, passwords and API keys, and variables marked Secret, are kept i
 
 A file that can't be read is skipped and reported at launch, and a copy ending in `.broken` is kept beside it. Nothing is saved over it, and no Keychain entries are cleaned up, until a launch reads everything cleanly.
 
+## Claude and other MCP clients
+
+`Apiapp --mcp` runs an MCP server over stdin and stdout without opening a window, so Claude can work with the library: "create a login request for the API and save the body and URL". Add it to Claude Code, using wherever `Apiapp.app` actually is:
+
+```bash
+claude mcp add --scope user apiapp -- /Applications/Apiapp.app/Contents/MacOS/Apiapp --mcp
+```
+
+| Tool | Does |
+| --- | --- |
+| `list_library` | Folders, saved requests and environments |
+| `get_request` | Everything about one saved request |
+| `save_request` | Creates a request, or changes the fields given on an existing one |
+| `create_folder` | Makes a folder, or finds the one with that name |
+| `save_environment` | Creates an environment or adds and updates its variables |
+
+- **A running Apiapp shows changes straight away.** A tab with unsaved edits keeps them, and saving it puts those edits back over Claude's version.
+- **Secrets never pass through it.** Tokens, passwords and API keys in a request must be `{{variable}}` references, and so must an `Authorization` header. A secret variable's value can't be set over MCP either. Type it in the environment editor, which keeps it in the Keychain.
+- **Nothing is deleted** over MCP.
+- **An open environment editor wins.** Saving it after Claude changed environments puts back what the editor shows.
+
 ## Other Behavior
 
 - **Removing Content-Type on a POST sends it blank.** macOS adds `application/x-www-form-urlencoded` to any POST body with no Content-Type, and a blank value is the only way to stop it. Other methods leave the header out entirely.

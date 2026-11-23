@@ -1,7 +1,18 @@
 import AppKit
 import SwiftUI
 
+/// `Apiapp --mcp` runs the MCP server over stdin and stdout and never opens a window.
 @main
+enum Launcher {
+    @MainActor static func main() {
+        if CommandLine.arguments.dropFirst().contains("--mcp") {
+            MCPServer.runOverStandardIO()
+        } else {
+            ApiappApp.main()
+        }
+    }
+}
+
 struct ApiappApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
